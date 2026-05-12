@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# =============================================================================
+# tsdb-snapshot — EBS snapshot of TimescaleDB volume
+#
+# Takes a crash-consistent EBS snapshot. For standbys this is equivalent to
+# application-consistent since WAL replay handles recovery.
+# On a promoted primary, pass --consistent to bracket with pg_backup_start/stop.
+#
+# Usage:
+#   tsdb-snapshot                          # crash-consistent snapshot
+#   tsdb-snapshot --label "pre-promote"    # custom label
+#   tsdb-snapshot --consistent             # pg_backup_start/stop (primary only)
+# =============================================================================
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../k8-lib/common.sh"
+
+NAMESPACE="${K8_NAMESPACE:-default}"
+POD_LABEL="app.kubernetes.io/name=${K8_TSDB_LABEL:-timescaledb}"
+REGION="${AWS_DEFAULT_REGION:-${K8_AWS_REGION:-us-east-1}}"
+LABEL="manual"
+CONSISTENT=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --label) LABEL="$2"; shift 2 ;;
+    --consistent) CONSISTENT=true; shift ;;
+    *) die "Unknown argument: $1" ;;
+  esac
+done
+
+TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+SNAPSHOT_NAME="${K8_TSDB_SNAPSHOT_NAME:-timescaledb-snapshot}"
+SNAPSHOT_DESC="${SNAPSHOT_NAME} ${LABEL} ${TIMESTAMP}"
+
+# ── Find pod ────────────────────────────────────────────────────────────────
+DB_NAME="${K8_DB_NAME:-postgres}"
+step "Finding timescaledb pod"
+POD="$(kubectl -n "$NAMESPACE" get pod -l "$POD_LABEL" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" \
+  || die "No pod found with label $POD_LABEL in namespace $NAMESPACE"
+ok "Pod: $POD"
+
+# ── Resolve PVC → PV → EBS volume ──────────────────────────────────────────
+step "Resolving EBS volume from PVC"
+PVC="$(kubectl -n "$NAMESPACE" get pod "$POD" -o jsonpath='{.spec.volumes[?(@.persistentVolumeClaim)].persistentVolumeClaim.claimName}')" \
+  || die "Could not find PVC on pod $POD"
+ok "PVC: $PVC"
+
+PV="$(kubectl get pvc -n "$NAMESPACE" "$PVC" -o jsonpath='{.spec.volumeName}')" \
+  || die "Could not resolve PV from PVC $PVC"
+ok "PV:  $PV"
+
+VOLUME_ID="$(kubectl get pv "$PV" -o jsonpath='{.spec.csi.volumeHandle}')" \
+  || die "Could not get EBS volume handle from PV $PV"
+ok "EBS: $VOLUME_ID"
+
+# ── Optional: pg_backup_start (primary only) ────────────────────────────────
+if [[ "$CONSISTENT" == "true" ]]; then
+  step "Starting Postgres backup mode (forces checkpoint)"
+  kubectl -n "$NAMESPACE" exec "$POD" -- \
+    psql -U postgres -d "$DB_NAME" -c "SELECT pg_backup_start('${SNAPSHOT_DESC}');" \
+    || die "pg_backup_start failed — is this a standby? Use without --consistent."
+  ok "Backup mode active"
+fi
+
+# ── Create EBS snapshot ─────────────────────────────────────────────────────
+step "Creating EBS snapshot"
+SNAPSHOT_ID="$(aws ec2 create-snapshot \
+  --region "$REGION" \
+  --volume-id "$VOLUME_ID" \
+  --description "$SNAPSHOT_DESC" \
+  --tag-specifications "ResourceType=snapshot,Tags=[{Key=Name,Value=${SNAPSHOT_NAME}},{Key=Source,Value=tsdb-snapshot},{Key=Label,Value=${LABEL}},{Key=Timestamp,Value=${TIMESTAMP}}]" \
+  --query 'SnapshotId' --output text)" \
+  || {
+    if [[ "$CONSISTENT" == "true" ]]; then
+      warn "Snapshot failed — releasing backup mode"
+      kubectl -n "$NAMESPACE" exec "$POD" -- \
+        psql -U postgres -d "$DB_NAME" -c "SELECT pg_backup_stop();" 2>/dev/null
+    fi
+    die "aws ec2 create-snapshot failed for $VOLUME_ID"
+  }
+ok "Snapshot: $SNAPSHOT_ID"
+
+# ── Optional: pg_backup_stop ────────────────────────────────────────────────
+if [[ "$CONSISTENT" == "true" ]]; then
+  step "Stopping Postgres backup mode"
+  kubectl -n "$NAMESPACE" exec "$POD" -- \
+    psql -U postgres -d "$DB_NAME" -c "SELECT pg_backup_stop();" \
+    || warn "pg_backup_stop failed — backup mode may need manual cleanup"
+  ok "Backup mode released"
+fi
+
+# ── Summary ─────────────────────────────────────────────────────────────────
+echo ""
+echo -e "${GRN}Snapshot initiated successfully${NC}"
+echo -e "  Snapshot ID:  ${SNAPSHOT_ID}"
+echo -e "  Volume:       ${VOLUME_ID}"
+echo -e "  Description:  ${SNAPSHOT_DESC}"
+echo -e "  Region:       ${REGION}"
+echo -e "  Mode:         $(if [[ "$CONSISTENT" == "true" ]]; then echo "app-consistent"; else echo "crash-consistent"; fi)"
+echo ""
+echo -e "  Monitor progress:"
+echo -e "    aws ec2 describe-snapshots --snapshot-ids ${SNAPSHOT_ID} --query 'Snapshots[0].Progress'"
