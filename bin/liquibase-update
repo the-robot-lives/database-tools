@@ -8,7 +8,7 @@ set -euo pipefail
 
 NAMESPACE="gnp"
 IMAGE="783147025407.dkr.ecr.us-east-1.amazonaws.com/gnp-backend-liquibase"
-TAG="${LIQUIBASE_TAG:-v1.0.0}"
+TAG="${LIQUIBASE_TAG:-v1.0.1}"
 DB_HOST="gnp-timescaledb.gnp.svc.cluster.local"
 DB_PORT="5432"
 DB_NAME="gnp-prod-db"
