@@ -13,7 +13,9 @@
 # =============================================================================
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/../k8-lib/common.sh"
+K8_LIB_DIR="${K8_LIB_DIR:-$(cd "$SCRIPT_DIR/../../k8-lib" 2>/dev/null && pwd || echo "${HOME}/.local/share/k8-lib")}"
+INFRA_ROOT="${INFRA_ROOT:-$(pwd)}"
+source "$K8_LIB_DIR/bin/common.sh"
 
 NAMESPACE="${K8_NAMESPACE:-default}"
 POD_LABEL="app.kubernetes.io/name=${K8_TSDB_LABEL:-timescaledb}"
