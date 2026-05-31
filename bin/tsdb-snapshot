@@ -112,7 +112,7 @@ ok "EBS: $VOLUME_ID"
 if [[ "$CONSISTENT" == "true" ]]; then
   step "Starting Postgres backup mode (forces checkpoint)"
   kubectl -n "$NAMESPACE" exec "$POD" -- \
-    psql -U postgres -d "$DB_NAME" -c "SELECT pg_backup_start('${SNAPSHOT_DESC}');" \
+    psql -U postgres -d "$DB_NAME" -c "SET statement_timeout = 0; SELECT pg_backup_start('${SNAPSHOT_DESC}');" \
     || die "pg_backup_start failed — is this a standby? Use --crash-only."
   ok "Backup mode active"
 fi
@@ -129,7 +129,7 @@ SNAPSHOT_ID="$(aws ec2 create-snapshot \
     if [[ "$CONSISTENT" == "true" ]]; then
       warn "Snapshot failed — releasing backup mode"
       kubectl -n "$NAMESPACE" exec "$POD" -- \
-        psql -U postgres -d "$DB_NAME" -c "SELECT pg_backup_stop();" 2>/dev/null
+        psql -U postgres -d "$DB_NAME" -c "SET statement_timeout = 0; SELECT pg_backup_stop();" 2>/dev/null
     fi
     die "aws ec2 create-snapshot failed for $VOLUME_ID"
   }
@@ -139,7 +139,7 @@ ok "Snapshot: $SNAPSHOT_ID"
 if [[ "$CONSISTENT" == "true" ]]; then
   step "Stopping Postgres backup mode"
   kubectl -n "$NAMESPACE" exec "$POD" -- \
-    psql -U postgres -d "$DB_NAME" -c "SELECT pg_backup_stop();" \
+    psql -U postgres -d "$DB_NAME" -c "SET statement_timeout = 0; SELECT pg_backup_stop();" \
     || warn "pg_backup_stop failed — backup mode may need manual cleanup"
   ok "Backup mode released"
 fi
