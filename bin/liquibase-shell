@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# Interactive Liquibase shell with kubectl port-forward to K8s databases.
+# Usage: liquibase-shell [target] [-- liquibase-args...]
+#
+# Targets:
+#   prod       — Production PG via gnp-pgbouncer (→ EC2 primary 172.30.0.250)
+#   stage      — Stage PG via stage-gnp-pgbouncer
+#   mysql      — Production MySQL (gnp-mysqldb)
+#   mysql-stage — Stage MySQL (stage-gnp-mysqldb)
+#   replica    — Production read replica (gnp-pgbouncer-readonly) [read-only]
+#
+# Without liquibase-args, drops into an interactive menu.
+# With args, runs the command and exits.
+#
+# Examples:
+#   liquibase-shell prod                    # interactive menu
+#   liquibase-shell prod -- status          # one-shot: show pending changesets
+#   liquibase-shell prod -- update-sql      # one-shot: preview SQL
+#   liquibase-shell prod -- update          # one-shot: apply migrations
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+CHANGELOG_DIR="$REPO_ROOT/repos/gnp-backend/liquibase"
+
+LOCAL_PORT_PG=54320
+LOCAL_PORT_MYSQL=33060
+PF_PID=""
+TMPDIR_LB=""
+
+cleanup() {
+  if [[ -n "$PF_PID" ]] && kill -0 "$PF_PID" 2>/dev/null; then
+    kill "$PF_PID" 2>/dev/null
+    wait "$PF_PID" 2>/dev/null || true
+  fi
+  [[ -n "$TMPDIR_LB" && -d "$TMPDIR_LB" ]] && rm -rf "$TMPDIR_LB"
+}
+trap cleanup EXIT INT TERM
+
+# --- Target selection ---
+TARGET="${1:-}"
+shift_args=false
+
+declare -A TARGETS=(
+  [prod]="gnp|svc/gnp-pgbouncer|6432|postgresql|gnp-prod-db|dbgnp_gnp|gnp-pgbouncer-secrets|EC2_DB_PASSWORD|gnp_migrate"
+  [stage]="gnp|svc/stage-gnp-pgbouncer|6432|postgresql|stage-gnp-db|dbgnp_gnp|stage-gnp-pgbouncer-secrets|DB_PASSWORD|gnp_migrate"
+  [mysql]="gnp|svc/gnp-mysqldb|3306|mysql|gnp|gnp|gnp-mysqldb-secrets|MYSQL_PASSWORD|gnp_admin"
+  [mysql-stage]="gnp|svc/stage-gnp-mysqldb|3306|mysql|gnp|gnp|stage-gnp-mysqldb-secrets|MYSQL_PASSWORD|gnp_admin"
+  [replica]="gnp|svc/gnp-pgbouncer-readonly|6432|postgresql|gnp-prod-db|dbgnp_gnp|gnp-pgbouncer-secrets|EC2_DB_PASSWORD|gnp_migrate"
+)
+
+if [[ -z "$TARGET" ]]; then
+  echo "Select a database target:"
+  echo ""
+  echo "  prod         Production PG (pgbouncer → EC2 primary)"
+  echo "  stage        Stage PG (pgbouncer → stage replica)"
+  echo "  mysql        Production MySQL"
+  echo "  mysql-stage  Stage MySQL"
+  echo "  replica      Production PG read replica [read-only]"
+  echo ""
+  read -rp "Target: " TARGET
+fi
+
+if [[ ! -v "TARGETS[$TARGET]" ]]; then
+  echo "Unknown target: $TARGET"
+  echo "Valid targets: ${!TARGETS[*]}"
+  exit 1
+fi
+
+# Parse remaining args: everything after "--" goes to liquibase
+LB_ARGS=()
+if [[ "${1:-}" == "--" ]]; then
+  shift
+  LB_ARGS=("$@")
+elif [[ $# -gt 0 ]]; then
+  # If first remaining arg looks like a liquibase command, treat all as lb args
+  LB_ARGS=("$@")
+fi
+
+IFS='|' read -r NAMESPACE SVC REMOTE_PORT DB_TYPE DB_NAME DB_SCHEMA SECRET_NAME SECRET_KEY DB_USER <<< "${TARGETS[$TARGET]}"
+
+if [[ "$DB_TYPE" == "mysql" ]]; then
+  LOCAL_PORT=$LOCAL_PORT_MYSQL
+else
+  LOCAL_PORT=$LOCAL_PORT_PG
+fi
+
+# --- Safety gate for prod ---
+if [[ "$TARGET" == "prod" && ${#LB_ARGS[@]} -gt 0 ]]; then
+  for arg in "${LB_ARGS[@]}"; do
+    case "$arg" in
+      update|rollback|rollback-count|drop-all|clear-checksums)
+        echo ""
+        echo "⚠  You are about to run '$arg' against PRODUCTION."
+        read -rp "Type 'yes' to confirm: " CONFIRM
+        [[ "$CONFIRM" != "yes" ]] && { echo "Aborted."; exit 1; }
+        break
+        ;;
+    esac
+  done
+fi
+
+if [[ "$TARGET" == "replica" ]]; then
+  echo ""
+  echo "⚠  Read replica selected — write operations will fail."
+  echo "   Use this for: status, diff, changelog-sync-sql"
+  echo ""
+fi
+
+# --- Fetch password from K8s secret ---
+echo "==> Fetching credentials from secret $SECRET_NAME/$SECRET_KEY..."
+DB_PASS=$(kubectl get secret -n "$NAMESPACE" "$SECRET_NAME" -o jsonpath="{.data.$SECRET_KEY}" 2>/dev/null | base64 -d) || {
+  echo "Failed to read secret $SECRET_NAME/$SECRET_KEY in namespace $NAMESPACE"
+  exit 1
+}
+
+# --- Start port-forward ---
+echo "==> Port-forwarding $SVC:$REMOTE_PORT → localhost:$LOCAL_PORT"
+kubectl port-forward -n "$NAMESPACE" "$SVC" "$LOCAL_PORT:$REMOTE_PORT" &>/dev/null &
+PF_PID=$!
+
+# Wait for port to be ready
+for i in {1..20}; do
+  if nc -z localhost "$LOCAL_PORT" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$PF_PID" 2>/dev/null; then
+    echo "Port-forward process died. Is $SVC available in namespace $NAMESPACE?"
+    exit 1
+  fi
+  sleep 0.5
+done
+
+if ! nc -z localhost "$LOCAL_PORT" 2>/dev/null; then
+  echo "Timed out waiting for port-forward on localhost:$LOCAL_PORT"
+  exit 1
+fi
+echo "==> Port-forward active (pid $PF_PID)"
+
+# --- Build liquibase.properties in temp dir ---
+TMPDIR_LB=$(mktemp -d)
+
+if [[ "$DB_TYPE" == "postgresql" ]]; then
+  JDBC_URL="jdbc:postgresql://localhost:$LOCAL_PORT/$DB_NAME?currentSchema=$DB_SCHEMA"
+  cat > "$TMPDIR_LB/liquibase.properties" <<PROPS
+changeLogFile=$CHANGELOG_DIR/changelog-master.yaml
+url=$JDBC_URL
+username=$DB_USER
+password=$DB_PASS
+defaultSchemaName=$DB_SCHEMA
+liquibaseSchemaName=$DB_SCHEMA
+liquibase.hub.mode=off
+liquibase.show-banner=false
+PROPS
+elif [[ "$DB_TYPE" == "mysql" ]]; then
+  JDBC_URL="jdbc:mysql://localhost:$LOCAL_PORT/$DB_NAME"
+  cat > "$TMPDIR_LB/liquibase.properties" <<PROPS
+changeLogFile=$CHANGELOG_DIR/changelog-master.yaml
+url=$JDBC_URL
+username=$DB_USER
+password=$DB_PASS
+defaultSchemaName=$DB_SCHEMA
+liquibase.hub.mode=off
+liquibase.show-banner=false
+PROPS
+fi
+
+echo "==> Connected: $DB_TYPE @ localhost:$LOCAL_PORT/$DB_NAME (user: $DB_USER)"
+echo ""
+
+# --- Run liquibase ---
+run_lb() {
+  liquibase --defaults-file="$TMPDIR_LB/liquibase.properties" "$@"
+}
+
+if [[ ${#LB_ARGS[@]} -gt 0 ]]; then
+  # One-shot mode
+  echo "==> Running: liquibase ${LB_ARGS[*]}"
+  echo ""
+  run_lb "${LB_ARGS[@]}"
+else
+  # Interactive menu
+  echo "Liquibase interactive shell — $TARGET"
+  echo "Changelog: $CHANGELOG_DIR/changelog-master.yaml"
+  echo ""
+  while true; do
+    echo "Commands:"
+    echo "  1) status            — show pending changesets"
+    echo "  2) update-sql        — preview SQL (dry run)"
+    echo "  3) update            — apply pending migrations"
+    echo "  4) rollback-sql N    — preview rollback of N changesets"
+    echo "  5) history           — show applied changesets"
+    echo "  6) diff              — diff database vs changelog"
+    echo "  7) validate          — validate changelog syntax"
+    echo "  8) custom            — enter a custom liquibase command"
+    echo "  q) quit"
+    echo ""
+    read -rp "> " CHOICE
+
+    case "$CHOICE" in
+      1|status)
+        run_lb status
+        ;;
+      2|update-sql)
+        run_lb update-sql
+        ;;
+      3|update)
+        if [[ "$TARGET" == "prod" ]]; then
+          read -rp "⚠  Apply to PRODUCTION — type 'yes': " CONFIRM
+          [[ "$CONFIRM" != "yes" ]] && { echo "Skipped."; continue; }
+        fi
+        run_lb update
+        ;;
+      4|rollback*)
+        read -rp "Number of changesets to preview rollback for: " N
+        run_lb rollback-count-sql "$N"
+        ;;
+      5|history)
+        run_lb history
+        ;;
+      6|diff)
+        run_lb diff
+        ;;
+      7|validate)
+        run_lb validate
+        ;;
+      8|custom)
+        read -rp "liquibase command (e.g. 'tag v1.0'): " CMD
+        # shellcheck disable=SC2086
+        run_lb $CMD
+        ;;
+      q|quit|exit)
+        echo "Bye."
+        break
+        ;;
+      "")
+        continue
+        ;;
+      *)
+        echo "Unknown choice: $CHOICE"
+        ;;
+    esac
+    echo ""
+  done
+fi

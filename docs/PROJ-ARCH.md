@@ -33,14 +33,14 @@ graph TB
 
 | Component | Purpose |
 |-----------|---------|
-| `bin/tsdb-snapshot` | EBS snapshot of TimescaleDB volume with optional app-consistent mode via `pg_backup_start/stop` |
+| `bin/tsdb-snapshot` | App-consistent EBS snapshot of TimescaleDB primary via `pg_backup_start/stop` (default); `--crash-only` to skip |
 | `bin/pgbouncer-auth-setup.sql` | Creates PgBouncer auth user with `SECURITY DEFINER` credential lookup and a read-only application user |
 | `bin/sql/create-migrate-user.sql` | Provisions a migration role with DDL privileges scoped to application and public schemas |
 | `Makefile` | Installs `tsdb-snapshot` to `~/.local/bin`; SQL files are manual-copy templates |
 
 ## Key Design Decisions
 
-- **Crash-consistent by default**: `tsdb-snapshot` takes crash-consistent EBS snapshots (safe for standbys via WAL replay). App-consistent mode (`--consistent`) is opt-in for promoted primaries only.
+- **App-consistent by default**: `tsdb-snapshot` brackets EBS snapshots with `pg_backup_start/stop` on the primary (forces checkpoint, marks WAL for recovery). Use `--crash-only` to skip the bracket when snapshotting a standby volume.
 - **Least-privilege SQL roles**: PgBouncer auth user has no superuser; reads `pg_shadow` through a `SECURITY DEFINER` function. Migrate user inherits `postgres` only for index creation on existing tables.
 - **Template-based SQL**: SQL files use `${VARIABLE}` placeholders rather than dynamic generation -- operator reviews and customizes before execution.
 

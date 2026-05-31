@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # =============================================================================
-# tsdb-snapshot — EBS snapshot of TimescaleDB volume
+# tsdb-snapshot — EBS snapshot of TimescaleDB primary volume
 #
-# Takes a crash-consistent EBS snapshot. For standbys this is equivalent to
-# application-consistent since WAL replay handles recovery.
-# On a promoted primary, pass --consistent to bracket with pg_backup_start/stop.
+# Takes an application-consistent EBS snapshot of the primary by bracketing
+# with pg_backup_start/stop (forces a checkpoint, marks WAL for recovery).
+# Pass --crash-only to skip the pg_backup bracket (e.g. for standby volumes).
 #
 # Usage:
-#   tsdb-snapshot                          # crash-consistent snapshot
+#   tsdb-snapshot                          # app-consistent snapshot (default)
 #   tsdb-snapshot --label "pre-promote"    # custom label
-#   tsdb-snapshot --consistent             # pg_backup_start/stop (primary only)
+#   tsdb-snapshot --crash-only             # skip pg_backup_start/stop
 # =============================================================================
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,7 +37,7 @@ NAMESPACE="${K8_NAMESPACE:-default}"
 POD_LABEL="app.kubernetes.io/name=${K8_TSDB_LABEL:-timescaledb}"
 REGION="${AWS_DEFAULT_REGION:-${K8_AWS_REGION:-us-east-1}}"
 LABEL="manual"
-CONSISTENT=false
+CONSISTENT=true
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -45,6 +45,7 @@ while [[ $# -gt 0 ]]; do
     --config=*) shift ;;
     --label) LABEL="$2"; shift 2 ;;
     --consistent) CONSISTENT=true; shift ;;
+    --crash-only) CONSISTENT=false; shift ;;
     *) die "Unknown argument: $1" ;;
   esac
 done
