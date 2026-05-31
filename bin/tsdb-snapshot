@@ -1,30 +1,33 @@
 #!/usr/bin/env bash
 # =============================================================================
-# tsdb-snapshot — EBS snapshot of TimescaleDB primary volume
+# tsdb-snapshot — EBS snapshot of TimescaleDB volume
 #
-# Takes an application-consistent EBS snapshot of the primary by bracketing
-# with pg_backup_start/stop (forces a checkpoint, marks WAL for recovery).
+# Takes an application-consistent EBS snapshot by bracketing with
+# pg_backup_start/stop (forces a checkpoint, marks WAL for recovery).
 # Pass --crash-only to skip the pg_backup bracket (e.g. for standby volumes).
 #
 # Usage:
-#   tsdb-snapshot                          # app-consistent snapshot (default)
-#   tsdb-snapshot --label "pre-promote"    # custom label
-#   tsdb-snapshot --crash-only             # skip pg_backup_start/stop
+#   tsdb-snapshot --config gnp --label "pre-promote"
+#   tsdb-snapshot --config gnp-replica --label "daily"
+#   tsdb-snapshot --config gnp --crash-only
+#
+# Targets are defined in infra-config.yaml under tsdb_snapshot_targets.
 # =============================================================================
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 K8_LIB_DIR="${K8_LIB_DIR:-${HOME}/.local/share/k8-lib}"
 INFRA_ROOT="${INFRA_ROOT:-$(pwd)}"
 
-# Pre-parse --config (must resolve before k8-lib sourcing)
-for _k8_arg in "$@"; do
-  case "$_k8_arg" in
-    --config=*) export K8_CONFIG="${_k8_arg#--config=}" ;;
-  esac
-done
+# Pre-parse --config as a TARGET NAME (not a file path).
+# We still need infra-config.yaml resolved via standard mechanisms, so do NOT
+# export K8_CONFIG here — let the git-root walker find infra-config.yaml.
+_TSDB_TARGET=""
 _k8_prev=""
 for _k8_arg in "$@"; do
-  [[ "$_k8_prev" == "--config" ]] && export K8_CONFIG="$_k8_arg"
+  case "$_k8_arg" in
+    --config=*) _TSDB_TARGET="${_k8_arg#--config=}" ;;
+  esac
+  [[ "$_k8_prev" == "--config" ]] && _TSDB_TARGET="$_k8_arg"
   _k8_prev="$_k8_arg"
 done
 unset _k8_arg _k8_prev
@@ -33,12 +36,42 @@ source "$K8_LIB_DIR/bin/common.sh"
 source "$K8_LIB_DIR/bin/assist.sh"
 _k8_check_assist "$0" "$@"
 
-NAMESPACE="${K8_NAMESPACE:-default}"
-POD_LABEL="app.kubernetes.io/name=${K8_TSDB_LABEL:-timescaledb}"
+# ── Resolve named target from YAML ─────────────────────────────────────────
+if [[ -z "$_TSDB_TARGET" ]]; then
+  # List available targets and bail
+  echo "Usage: tsdb-snapshot --config <target> [--label <text>] [--crash-only]" >&2
+  echo "" >&2
+  echo "Available targets:" >&2
+  yq eval '.tsdb_snapshot_targets | keys | .[]' "$_K8_MERGED_CONFIG" 2>/dev/null | while read -r t; do
+    local_desc="$(yq eval ".tsdb_snapshot_targets.\"$t\".description // \"\"" "$_K8_MERGED_CONFIG" 2>/dev/null)"
+    printf "  %-20s %s\n" "$t" "$local_desc" >&2
+  done
+  exit 1
+fi
+
+_target_exists="$(yq eval ".tsdb_snapshot_targets.\"$_TSDB_TARGET\" // \"\"" "$_K8_MERGED_CONFIG" 2>/dev/null)"
+if [[ -z "$_target_exists" || "$_target_exists" == "null" ]]; then
+  echo "❌ Unknown snapshot target: $_TSDB_TARGET" >&2
+  echo "   Available targets:" >&2
+  yq eval '.tsdb_snapshot_targets | keys | .[]' "$_K8_MERGED_CONFIG" 2>/dev/null | sed 's/^/     /' >&2
+  exit 1
+fi
+
+# Load target values (env vars override YAML)
+_tgt=".tsdb_snapshot_targets.\"$_TSDB_TARGET\""
+NAMESPACE="${K8_NAMESPACE:-$(yq eval "$_tgt.namespace // \"gnp\"" "$_K8_MERGED_CONFIG")}"
+K8_TSDB_LABEL="${K8_TSDB_LABEL:-$(yq eval "$_tgt.pod_label // \"timescaledb\"" "$_K8_MERGED_CONFIG")}"
+SNAPSHOT_NAME="${K8_TSDB_SNAPSHOT_NAME:-$(yq eval "$_tgt.snapshot_name // \"timescaledb-snapshot\"" "$_K8_MERGED_CONFIG")}"
+DB_NAME="${K8_DB_NAME:-$(yq eval "$_tgt.db_name // \"postgres\"" "$_K8_MERGED_CONFIG")}"
+_yaml_crash="$(yq eval "$_tgt.crash_only // false" "$_K8_MERGED_CONFIG")"
+
+POD_LABEL="app.kubernetes.io/name=${K8_TSDB_LABEL}"
 REGION="${AWS_DEFAULT_REGION:-${K8_AWS_REGION:-us-east-1}}"
 LABEL="manual"
 CONSISTENT=true
+[[ "$_yaml_crash" == "true" ]] && CONSISTENT=false
 
+# ── Parse remaining args ───────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) shift 2 ;;
@@ -51,11 +84,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-SNAPSHOT_NAME="${K8_TSDB_SNAPSHOT_NAME:-timescaledb-snapshot}"
 SNAPSHOT_DESC="${SNAPSHOT_NAME} ${LABEL} ${TIMESTAMP}"
 
+info "Target: $_TSDB_TARGET (ns=$NAMESPACE, label=$POD_LABEL, mode=$(if [[ "$CONSISTENT" == "true" ]]; then echo "consistent"; else echo "crash-only"; fi))"
+
 # ── Find pod ────────────────────────────────────────────────────────────────
-DB_NAME="${K8_DB_NAME:-postgres}"
 step "Finding timescaledb pod"
 POD="$(kubectl -n "$NAMESPACE" get pod -l "$POD_LABEL" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" \
   || die "No pod found with label $POD_LABEL in namespace $NAMESPACE"
@@ -80,7 +113,7 @@ if [[ "$CONSISTENT" == "true" ]]; then
   step "Starting Postgres backup mode (forces checkpoint)"
   kubectl -n "$NAMESPACE" exec "$POD" -- \
     psql -U postgres -d "$DB_NAME" -c "SELECT pg_backup_start('${SNAPSHOT_DESC}');" \
-    || die "pg_backup_start failed — is this a standby? Use without --consistent."
+    || die "pg_backup_start failed — is this a standby? Use --crash-only."
   ok "Backup mode active"
 fi
 
@@ -90,7 +123,7 @@ SNAPSHOT_ID="$(aws ec2 create-snapshot \
   --region "$REGION" \
   --volume-id "$VOLUME_ID" \
   --description "$SNAPSHOT_DESC" \
-  --tag-specifications "ResourceType=snapshot,Tags=[{Key=Name,Value=${SNAPSHOT_NAME}},{Key=Source,Value=tsdb-snapshot},{Key=Label,Value=${LABEL}},{Key=Timestamp,Value=${TIMESTAMP}}]" \
+  --tag-specifications "ResourceType=snapshot,Tags=[{Key=Name,Value=${SNAPSHOT_NAME}},{Key=Source,Value=tsdb-snapshot},{Key=Label,Value=${LABEL}},{Key=Timestamp,Value=${TIMESTAMP}},{Key=Target,Value=${_TSDB_TARGET}}]" \
   --query 'SnapshotId' --output text)" \
   || {
     if [[ "$CONSISTENT" == "true" ]]; then
@@ -114,6 +147,7 @@ fi
 # ── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GRN}Snapshot initiated successfully${NC}"
+echo -e "  Target:       ${_TSDB_TARGET}"
 echo -e "  Snapshot ID:  ${SNAPSHOT_ID}"
 echo -e "  Volume:       ${VOLUME_ID}"
 echo -e "  Description:  ${SNAPSHOT_DESC}"
