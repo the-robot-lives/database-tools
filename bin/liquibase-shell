@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # Interactive Liquibase shell with kubectl port-forward to K8s databases.
+# Loads targets from liquibase-targets.yaml config files.
+#
 # Usage: liquibase-shell [target] [-- liquibase-args...]
 #
-# Targets:
-#   prod       — Production PG via gnp-pgbouncer (→ EC2 primary 172.30.0.250)
-#   stage      — Stage PG via stage-gnp-pgbouncer
-#   mysql      — Production MySQL (gnp-mysqldb)
-#   mysql-stage — Stage MySQL (stage-gnp-mysqldb)
-#   replica    — Production read replica (gnp-pgbouncer-readonly) [read-only]
+# Config resolution (first match wins):
+#   1. $LIQUIBASE_CONFIG (env var, explicit path)
+#   2. ./infra-config.yaml (cwd)
+#   3. <repo-root>/infra-config.yaml
+#   4. ./.infra-config.yaml / <repo-root>/.infra-config.yaml
 #
-# Without liquibase-args, drops into an interactive menu.
-# With args, runs the command and exits.
+# Reads the `liquibase_targets` section from infra-config.yaml.
 #
 # Examples:
 #   liquibase-shell prod                    # interactive menu
@@ -21,10 +21,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-CHANGELOG_DIR="$REPO_ROOT/repos/gnp-backend/liquibase"
 
-LOCAL_PORT_PG=54320
-LOCAL_PORT_MYSQL=33060
 PF_PID=""
 TMPDIR_LB=""
 
@@ -37,33 +34,70 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# --- Locate config file ---
+find_config() {
+  # Resolve symlinks to find repo root
+  local real_script
+  real_script="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+  local real_dir="$(cd "$(dirname "$real_script")" && pwd)"
+  local real_repo="$(cd "$real_dir/../../.." 2>/dev/null && pwd)"
+
+  local candidates=(
+    "${LIQUIBASE_CONFIG:-}"
+    "./infra-config.yaml"
+    "$REPO_ROOT/infra-config.yaml"
+    "$real_repo/infra-config.yaml"
+    "./.infra-config.yaml"
+    "$REPO_ROOT/.infra-config.yaml"
+    "$real_repo/.infra-config.yaml"
+  )
+  for f in "${candidates[@]}"; do
+    [[ -n "$f" && -f "$f" ]] && { echo "$f"; return 0; }
+  done
+  echo "ERROR: No infra-config.yaml found." >&2
+  echo "Searched:" >&2
+  for f in "${candidates[@]}"; do
+    [[ -n "$f" ]] && echo "  $f" >&2
+  done
+  return 1
+}
+
+CONFIG_FILE="$(find_config)"
+
+# --- Helper: read a target field from config ---
+cfg() {
+  local target="$1" field="$2"
+  yq -r "(.liquibase_targets.\"$target\".\"$field\" // \"\")" "$CONFIG_FILE"
+}
+
+# --- List available targets ---
+list_targets() {
+  yq -r '.liquibase_targets | keys[]' "$CONFIG_FILE"
+}
+
 # --- Target selection ---
 TARGET="${1:-}"
-shift_args=false
-
-declare -A TARGETS=(
-  [prod]="gnp|svc/gnp-pgbouncer|6432|postgresql|gnp-prod-db|dbgnp_gnp|gnp-pgbouncer-secrets|EC2_DB_PASSWORD|gnp_migrate"
-  [stage]="gnp|svc/stage-gnp-pgbouncer|6432|postgresql|stage-gnp-db|dbgnp_gnp|stage-gnp-pgbouncer-secrets|DB_PASSWORD|gnp_migrate"
-  [mysql]="gnp|svc/gnp-mysqldb|3306|mysql|gnp|gnp|gnp-mysqldb-secrets|MYSQL_PASSWORD|gnp_admin"
-  [mysql-stage]="gnp|svc/stage-gnp-mysqldb|3306|mysql|gnp|gnp|stage-gnp-mysqldb-secrets|MYSQL_PASSWORD|gnp_admin"
-  [replica]="gnp|svc/gnp-pgbouncer-readonly|6432|postgresql|gnp-prod-db|dbgnp_gnp|gnp-pgbouncer-secrets|EC2_DB_PASSWORD|gnp_migrate"
-)
+if [[ -n "$TARGET" && "$TARGET" != "--" ]]; then
+  shift
+else
+  TARGET=""
+fi
 
 if [[ -z "$TARGET" ]]; then
   echo "Select a database target:"
   echo ""
-  echo "  prod         Production PG (pgbouncer → EC2 primary)"
-  echo "  stage        Stage PG (pgbouncer → stage replica)"
-  echo "  mysql        Production MySQL"
-  echo "  mysql-stage  Stage MySQL"
-  echo "  replica      Production PG read replica [read-only]"
+  while IFS= read -r t; do
+    desc="$(cfg "$t" description)"
+    printf "  %-14s %s\n" "$t" "$desc"
+  done < <(list_targets)
   echo ""
   read -rp "Target: " TARGET
 fi
 
-if [[ ! -v "TARGETS[$TARGET]" ]]; then
+# Validate target exists in config
+if [[ -z "$(cfg "$TARGET" "namespace")" ]]; then
   echo "Unknown target: $TARGET"
-  echo "Valid targets: ${!TARGETS[*]}"
+  echo "Valid targets: $(list_targets | tr '\n' ' ')"
   exit 1
 fi
 
@@ -73,37 +107,53 @@ if [[ "${1:-}" == "--" ]]; then
   shift
   LB_ARGS=("$@")
 elif [[ $# -gt 0 ]]; then
-  # If first remaining arg looks like a liquibase command, treat all as lb args
   LB_ARGS=("$@")
 fi
 
-IFS='|' read -r NAMESPACE SVC REMOTE_PORT DB_TYPE DB_NAME DB_SCHEMA SECRET_NAME SECRET_KEY DB_USER <<< "${TARGETS[$TARGET]}"
+# --- Load target config ---
+NAMESPACE="$(cfg "$TARGET" namespace)"
+SVC="$(cfg "$TARGET" service)"
+REMOTE_PORT="$(cfg "$TARGET" remote_port)"
+LOCAL_PORT="$(cfg "$TARGET" local_port)"
+DB_TYPE="$(cfg "$TARGET" db_type)"
+DB_NAME="$(cfg "$TARGET" db_name)"
+DB_SCHEMA="$(cfg "$TARGET" schema)"
+SECRET_NAME="$(cfg "$TARGET" secret_name)"
+SECRET_KEY="$(cfg "$TARGET" secret_key)"
+DB_USER="$(cfg "$TARGET" username)"
+SAFETY="$(cfg "$TARGET" safety)"
+CHANGELOG_REL="$(cfg "$TARGET" changelog_dir)"
+CHANGELOG_DIR="$REPO_ROOT/${CHANGELOG_REL:-repos/gnp-backend/liquibase}"
 
-if [[ "$DB_TYPE" == "mysql" ]]; then
-  LOCAL_PORT=$LOCAL_PORT_MYSQL
-else
-  LOCAL_PORT=$LOCAL_PORT_PG
-fi
+# --- Readonly operations whitelist ---
+READONLY_OPS="status diff validate history update-sql rollback-count-sql changelog-sync-sql"
 
-# --- Safety gate for prod ---
-if [[ "$TARGET" == "prod" && ${#LB_ARGS[@]} -gt 0 ]]; then
-  for arg in "${LB_ARGS[@]}"; do
-    case "$arg" in
+# --- Safety gate ---
+check_safety() {
+  local cmd="$1"
+  if [[ "$SAFETY" == "readonly" ]]; then
+    if ! echo "$READONLY_OPS" | grep -qw "$cmd"; then
+      echo "✗ Target '$TARGET' is read-only. Blocked: $cmd"
+      echo "  Allowed: $READONLY_OPS"
+      return 1
+    fi
+  elif [[ "$SAFETY" == "destructive" ]]; then
+    case "$cmd" in
       update|rollback|rollback-count|drop-all|clear-checksums)
         echo ""
-        echo "⚠  You are about to run '$arg' against PRODUCTION."
+        echo "⚠  You are about to run '$cmd' against $TARGET (DESTRUCTIVE)."
         read -rp "Type 'yes' to confirm: " CONFIRM
-        [[ "$CONFIRM" != "yes" ]] && { echo "Aborted."; exit 1; }
-        break
+        [[ "$CONFIRM" != "yes" ]] && { echo "Aborted."; return 1; }
         ;;
     esac
-  done
-fi
+  fi
+  return 0
+}
 
-if [[ "$TARGET" == "replica" ]]; then
+if [[ "$SAFETY" == "readonly" ]]; then
   echo ""
-  echo "⚠  Read replica selected — write operations will fail."
-  echo "   Use this for: status, diff, changelog-sync-sql"
+  echo "⚠  Read-only target selected — write operations will be blocked."
+  echo "   Allowed: $READONLY_OPS"
   echo ""
 fi
 
@@ -119,7 +169,6 @@ echo "==> Port-forwarding $SVC:$REMOTE_PORT → localhost:$LOCAL_PORT"
 kubectl port-forward -n "$NAMESPACE" "$SVC" "$LOCAL_PORT:$REMOTE_PORT" &>/dev/null &
 PF_PID=$!
 
-# Wait for port to be ready
 for i in {1..20}; do
   if nc -z localhost "$LOCAL_PORT" 2>/dev/null; then
     break
@@ -175,6 +224,7 @@ run_lb() {
 
 if [[ ${#LB_ARGS[@]} -gt 0 ]]; then
   # One-shot mode
+  check_safety "${LB_ARGS[0]}" || exit 1
   echo "==> Running: liquibase ${LB_ARGS[*]}"
   echo ""
   run_lb "${LB_ARGS[@]}"
@@ -182,6 +232,7 @@ else
   # Interactive menu
   echo "Liquibase interactive shell — $TARGET"
   echo "Changelog: $CHANGELOG_DIR/changelog-master.yaml"
+  echo "Config: $CONFIG_FILE"
   echo ""
   while true; do
     echo "Commands:"
@@ -199,35 +250,31 @@ else
 
     case "$CHOICE" in
       1|status)
-        run_lb status
+        check_safety "status" && run_lb status
         ;;
       2|update-sql)
-        run_lb update-sql
+        check_safety "update-sql" && run_lb update-sql
         ;;
       3|update)
-        if [[ "$TARGET" == "prod" ]]; then
-          read -rp "⚠  Apply to PRODUCTION — type 'yes': " CONFIRM
-          [[ "$CONFIRM" != "yes" ]] && { echo "Skipped."; continue; }
-        fi
-        run_lb update
+        check_safety "update" && run_lb update
         ;;
       4|rollback*)
         read -rp "Number of changesets to preview rollback for: " N
-        run_lb rollback-count-sql "$N"
+        check_safety "rollback-count-sql" && run_lb rollback-count-sql "$N"
         ;;
       5|history)
-        run_lb history
+        check_safety "history" && run_lb history
         ;;
       6|diff)
-        run_lb diff
+        check_safety "diff" && run_lb diff
         ;;
       7|validate)
-        run_lb validate
+        check_safety "validate" && run_lb validate
         ;;
       8|custom)
         read -rp "liquibase command (e.g. 'tag v1.0'): " CMD
         # shellcheck disable=SC2086
-        run_lb $CMD
+        check_safety "${CMD%% *}" && run_lb $CMD
         ;;
       q|quit|exit)
         echo "Bye."

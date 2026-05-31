@@ -28,16 +28,18 @@ The current script hardcodes targets in a bash associative array. The new versio
 
 ### Config file resolution (first match wins)
 
-1. `$LIQUIBASE_TARGETS` (env var, explicit path)
-2. `./liquibase-targets.yaml` (project-local override)
-3. `$REPO_ROOT/utils/database-tools/config/liquibase-targets.yaml` (shared default)
-4. `~/.config/gnp/liquibase-targets.yaml` (user-local)
+1. `$LIQUIBASE_CONFIG` (env var, explicit path)
+2. `./infra-config.yaml` (cwd)
+3. `<repo-root>/infra-config.yaml`
+4. `./.infra-config.yaml` / `<repo-root>/.infra-config.yaml`
+
+Targets live under the `liquibase_targets` key in `infra-config.yaml`, alongside other infra topology config.
 
 ### Config format
 
 ```yaml
-# liquibase-targets.yaml
-targets:
+# in infra-config.yaml
+liquibase_targets:
   prod:
     description: "Production PG (pgbouncer → EC2 primary)"
     namespace: gnp
