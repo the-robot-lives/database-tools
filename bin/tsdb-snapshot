@@ -135,8 +135,48 @@ SNAPSHOT_ID="$(aws ec2 create-snapshot \
   }
 ok "Snapshot: $SNAPSHOT_ID"
 
-# ── Optional: pg_backup_stop ────────────────────────────────────────────────
+# ── Wait for EBS snapshot to complete before releasing backup mode ──────────
 if [[ "$CONSISTENT" == "true" ]]; then
+  SNAPSHOT_TIMEOUT="${K8_TSDB_SNAPSHOT_TIMEOUT:-3600}"
+  step "Waiting for EBS snapshot to complete (timeout: ${SNAPSHOT_TIMEOUT}s)"
+
+  _snap_start="$(date +%s)"
+  _last_progress=""
+  while true; do
+    _elapsed="$(( $(date +%s) - _snap_start ))"
+    if [[ "$_elapsed" -ge "$SNAPSHOT_TIMEOUT" ]]; then
+      warn "Snapshot wait timed out after ${SNAPSHOT_TIMEOUT}s — releasing backup mode anyway"
+      kubectl -n "$NAMESPACE" exec "$POD" -- \
+        psql -U postgres -d "$DB_NAME" -c "SET statement_timeout = 0; SELECT pg_backup_stop();" 2>/dev/null \
+        || warn "pg_backup_stop failed — backup mode may need manual cleanup"
+      die "EBS snapshot $SNAPSHOT_ID did not complete within ${SNAPSHOT_TIMEOUT}s"
+    fi
+
+    _snap_json="$(aws ec2 describe-snapshots --region "$REGION" \
+      --snapshot-ids "$SNAPSHOT_ID" \
+      --query 'Snapshots[0].[State,Progress]' --output text 2>/dev/null)" || true
+    _snap_state="$(echo "$_snap_json" | awk '{print $1}')"
+    _snap_progress="$(echo "$_snap_json" | awk '{print $2}')"
+
+    if [[ "$_snap_state" == "completed" ]]; then
+      ok "Snapshot completed (100%) in ${_elapsed}s"
+      break
+    elif [[ "$_snap_state" == "error" ]]; then
+      warn "Snapshot entered error state — releasing backup mode"
+      kubectl -n "$NAMESPACE" exec "$POD" -- \
+        psql -U postgres -d "$DB_NAME" -c "SET statement_timeout = 0; SELECT pg_backup_stop();" 2>/dev/null \
+        || warn "pg_backup_stop failed — backup mode may need manual cleanup"
+      die "EBS snapshot $SNAPSHOT_ID failed"
+    fi
+
+    if [[ "$_snap_progress" != "$_last_progress" ]]; then
+      info "  Snapshot progress: ${_snap_progress} (${_elapsed}s elapsed)"
+      _last_progress="$_snap_progress"
+    fi
+
+    sleep 15
+  done
+
   step "Stopping Postgres backup mode"
   kubectl -n "$NAMESPACE" exec "$POD" -- \
     psql -U postgres -d "$DB_NAME" -c "SET statement_timeout = 0; SELECT pg_backup_stop();" \
