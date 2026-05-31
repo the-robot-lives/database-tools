@@ -2,7 +2,7 @@
 # Interactive Liquibase shell with kubectl port-forward to K8s databases.
 # Loads targets from liquibase-targets.yaml config files.
 #
-# Usage: liquibase-shell [target] [-- liquibase-args...]
+# Usage: liquibase-shell [target] [--shell | -- liquibase-args...]
 #
 # Config resolution (first match wins):
 #   1. $LIQUIBASE_CONFIG (env var, explicit path)
@@ -17,6 +17,7 @@
 #   liquibase-shell prod -- status          # one-shot: show pending changesets
 #   liquibase-shell prod -- update-sql      # one-shot: preview SQL
 #   liquibase-shell prod -- update          # one-shot: apply migrations
+#   liquibase-shell prod --shell            # drop into free-form liquibase prompt
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -102,8 +103,12 @@ if [[ -z "$(cfg "$TARGET" "namespace")" ]]; then
 fi
 
 # Parse remaining args: everything after "--" goes to liquibase
+SHELL_MODE=false
 LB_ARGS=()
-if [[ "${1:-}" == "--" ]]; then
+if [[ "${1:-}" == "--shell" ]]; then
+  SHELL_MODE=true
+  shift
+elif [[ "${1:-}" == "--" ]]; then
   shift
   LB_ARGS=("$@")
 elif [[ $# -gt 0 ]]; then
@@ -222,7 +227,33 @@ run_lb() {
   liquibase --defaults-file="$TMPDIR_LB/liquibase.properties" "$@"
 }
 
-if [[ ${#LB_ARGS[@]} -gt 0 ]]; then
+interactive_shell() {
+  echo ""
+  echo "Dropping into zsh with port-forward active."
+  echo "  DB: $DB_TYPE @ localhost:$LOCAL_PORT/$DB_NAME (user: $DB_USER)"
+  echo "  Liquibase properties: $TMPDIR_LB/liquibase.properties"
+  echo "  Type 'exit' to close the shell and tear down port-forward."
+  echo ""
+  export LB_DB_HOST=localhost
+  export LB_DB_PORT="$LOCAL_PORT"
+  export LB_DB_NAME="$DB_NAME"
+  export LB_DB_SCHEMA="$DB_SCHEMA"
+  export LB_DB_USER="$DB_USER"
+  export LB_DB_PASS="$DB_PASS"
+  export LB_DB_TYPE="$DB_TYPE"
+  export LB_TARGET="$TARGET"
+  export LB_DEFAULTS_FILE="$TMPDIR_LB/liquibase.properties"
+  if [[ "$DB_TYPE" == "postgresql" ]]; then
+    export PGHOST=localhost PGPORT="$LOCAL_PORT" PGDATABASE="$DB_NAME" PGUSER="$DB_USER" PGPASSWORD="$DB_PASS"
+  elif [[ "$DB_TYPE" == "mysql" ]]; then
+    export MYSQL_HOST=localhost MYSQL_TCP_PORT="$LOCAL_PORT" MYSQL_PWD="$DB_PASS"
+  fi
+  PROMPT="[lb:$TARGET] %~ %# " zsh
+}
+
+if [[ "$SHELL_MODE" == true ]]; then
+  interactive_shell
+elif [[ ${#LB_ARGS[@]} -gt 0 ]]; then
   # One-shot mode
   check_safety "${LB_ARGS[0]}" || exit 1
   echo "==> Running: liquibase ${LB_ARGS[*]}"
@@ -244,6 +275,7 @@ else
     echo "  6) diff              — diff database vs changelog"
     echo "  7) validate          — validate changelog syntax"
     echo "  8) custom            — enter a custom liquibase command"
+    echo "  9) shell             — drop into free-form liquibase prompt"
     echo "  q) quit"
     echo ""
     read -rp "> " CHOICE
@@ -275,6 +307,9 @@ else
         read -rp "liquibase command (e.g. 'tag v1.0'): " CMD
         # shellcheck disable=SC2086
         check_safety "${CMD%% *}" && run_lb $CMD
+        ;;
+      9|shell)
+        interactive_shell
         ;;
       q|quit|exit)
         echo "Bye."
