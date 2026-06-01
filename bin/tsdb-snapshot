@@ -108,11 +108,69 @@ VOLUME_ID="$(kubectl get pv "$PV" -o jsonpath='{.spec.csi.volumeHandle}')" \
   || die "Could not get EBS volume handle from PV $PV"
 ok "EBS: $VOLUME_ID"
 
+# ── Persistent psql session helpers (backup mode is session-scoped in PG15+) ─
+# We keep a single kubectl exec psql session alive via a FIFO so that
+# pg_backup_start and pg_backup_stop run in the same connection.
+_PSQL_FIFO=""
+_PSQL_PID=""
+_PSQL_OUT=""
+
+_psql_session_start() {
+  _PSQL_FIFO="$(mktemp -d)/psql_in"
+  _PSQL_OUT="$(mktemp)"
+  mkfifo "$_PSQL_FIFO"
+  kubectl -n "$NAMESPACE" exec -i "$POD" -- \
+    psql -U postgres -d "$DB_NAME" -At < "$_PSQL_FIFO" > "$_PSQL_OUT" 2>&1 &
+  _PSQL_PID=$!
+  exec 7>"$_PSQL_FIFO"
+}
+
+_psql_session_exec() {
+  local sql="$1"
+  local marker="__TSDB_SNAP_DONE__"
+  truncate -s 0 "$_PSQL_OUT"
+  echo "SET statement_timeout = 0;" >&7
+  echo "$sql" >&7
+  echo "SELECT '${marker}';" >&7
+  local _wait=0
+  while ! grep -q "$marker" "$_PSQL_OUT" 2>/dev/null; do
+    sleep 0.5
+    _wait=$(( _wait + 1 ))
+    if [[ $_wait -ge 120 ]]; then
+      return 1
+    fi
+    if ! kill -0 "$_PSQL_PID" 2>/dev/null; then
+      return 1
+    fi
+  done
+  grep -v "$marker" "$_PSQL_OUT"
+  if grep -qi "^ERROR" "$_PSQL_OUT"; then
+    return 1
+  fi
+  return 0
+}
+
+_psql_session_stop() {
+  if [[ -n "$_PSQL_PID" ]] && kill -0 "$_PSQL_PID" 2>/dev/null; then
+    echo "\\q" >&7 2>/dev/null || true
+    exec 7>&- 2>/dev/null || true
+    wait "$_PSQL_PID" 2>/dev/null || true
+  fi
+  [[ -n "$_PSQL_FIFO" ]] && rm -rf "$(dirname "$_PSQL_FIFO")" 2>/dev/null || true
+  [[ -n "$_PSQL_OUT" ]] && rm -f "$_PSQL_OUT" 2>/dev/null || true
+  _PSQL_PID=""
+}
+
+trap '_psql_session_stop' EXIT
+
 # ── Optional: pg_backup_start (primary only) ────────────────────────────────
 if [[ "$CONSISTENT" == "true" ]]; then
+  step "Starting persistent psql session for backup bracketing"
+  _psql_session_start
+  ok "Session PID: $_PSQL_PID"
+
   step "Starting Postgres backup mode (forces checkpoint)"
-  kubectl -n "$NAMESPACE" exec "$POD" -- \
-    psql -U postgres -d "$DB_NAME" -c "SET statement_timeout = 0; SELECT pg_backup_start('${SNAPSHOT_DESC}');" \
+  _psql_session_exec "SELECT pg_backup_start('${SNAPSHOT_DESC}');" \
     || die "pg_backup_start failed — is this a standby? Use --crash-only."
   ok "Backup mode active"
 fi
@@ -128,8 +186,8 @@ SNAPSHOT_ID="$(aws ec2 create-snapshot \
   || {
     if [[ "$CONSISTENT" == "true" ]]; then
       warn "Snapshot failed — releasing backup mode"
-      kubectl -n "$NAMESPACE" exec "$POD" -- \
-        psql -U postgres -d "$DB_NAME" -c "SET statement_timeout = 0; SELECT pg_backup_stop();" 2>/dev/null
+      _psql_session_exec "SELECT pg_backup_stop();" 2>/dev/null || true
+      _psql_session_stop
     fi
     die "aws ec2 create-snapshot failed for $VOLUME_ID"
   }
@@ -146,9 +204,9 @@ if [[ "$CONSISTENT" == "true" ]]; then
     _elapsed="$(( $(date +%s) - _snap_start ))"
     if [[ "$_elapsed" -ge "$SNAPSHOT_TIMEOUT" ]]; then
       warn "Snapshot wait timed out after ${SNAPSHOT_TIMEOUT}s — releasing backup mode anyway"
-      kubectl -n "$NAMESPACE" exec "$POD" -- \
-        psql -U postgres -d "$DB_NAME" -c "SET statement_timeout = 0; SELECT pg_backup_stop();" 2>/dev/null \
+      _psql_session_exec "SELECT pg_backup_stop();" 2>/dev/null \
         || warn "pg_backup_stop failed — backup mode may need manual cleanup"
+      _psql_session_stop
       die "EBS snapshot $SNAPSHOT_ID did not complete within ${SNAPSHOT_TIMEOUT}s"
     fi
 
@@ -163,9 +221,9 @@ if [[ "$CONSISTENT" == "true" ]]; then
       break
     elif [[ "$_snap_state" == "error" ]]; then
       warn "Snapshot entered error state — releasing backup mode"
-      kubectl -n "$NAMESPACE" exec "$POD" -- \
-        psql -U postgres -d "$DB_NAME" -c "SET statement_timeout = 0; SELECT pg_backup_stop();" 2>/dev/null \
+      _psql_session_exec "SELECT pg_backup_stop();" 2>/dev/null \
         || warn "pg_backup_stop failed — backup mode may need manual cleanup"
+      _psql_session_stop
       die "EBS snapshot $SNAPSHOT_ID failed"
     fi
 
@@ -178,10 +236,10 @@ if [[ "$CONSISTENT" == "true" ]]; then
   done
 
   step "Stopping Postgres backup mode"
-  kubectl -n "$NAMESPACE" exec "$POD" -- \
-    psql -U postgres -d "$DB_NAME" -c "SET statement_timeout = 0; SELECT pg_backup_stop();" \
+  _psql_session_exec "SELECT pg_backup_stop();" \
     || warn "pg_backup_stop failed — backup mode may need manual cleanup"
   ok "Backup mode released"
+  _psql_session_stop
 fi
 
 # ── Summary ─────────────────────────────────────────────────────────────────
