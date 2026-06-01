@@ -22,8 +22,10 @@ make install    # Installs liquibase-shell, liquibase-update, tsdb-snapshot
 or `.infra-config.yaml`. Set `LIQUIBASE_CONFIG=/path/to/config.yaml` to override
 the default search.
 
-Targets define the Kubernetes service to port-forward, the secret key to read,
-and the Liquibase changelog path. Example:
+Targets define the Kubernetes service to port-forward, the secret keys to read,
+and optionally the Liquibase changelog path. Instance-level targets may omit a
+changelog and are treated as connection shells unless a `--changelog-file`
+argument is supplied. Example:
 
 ```yaml
 liquibase_targets:
@@ -63,11 +65,14 @@ liquibase-shell start-app       # interactive Liquibase menu
 liquibase-shell start-app -- status
 liquibase-shell start-app -- update-sql
 liquibase-shell start-app --shell
+liquibase-shell shared-postgres --shell
+liquibase-shell shared-postgres -- --changelog-file=/path/to/changelog.yaml status
 ```
 
 `--shell` exports `LB_DEFAULTS_FILE`, `PGHOST`, `PGPORT`, `PGDATABASE`,
 `PGUSER`, and `PGPASSWORD` for PostgreSQL targets while keeping the
-port-forward alive.
+port-forward alive. It also exports `LB_CHANGELOG_PATH` and
+`LB_CHANGELOG_DIR`; these are empty for connection-only instance targets.
 
 ## SQL Templates
 

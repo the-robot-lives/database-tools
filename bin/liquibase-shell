@@ -201,6 +201,9 @@ REMOTE_PORT="$(cfg "$TARGET" remote_port)"
 LOCAL_PORT="$(cfg "$TARGET" local_port)"
 DB_TYPE="$(cfg "$TARGET" db_type)"
 DB_NAME="$(cfg "$TARGET" db_name)"
+DB_NAME_KEY="$(cfg "$TARGET" db_name_key)"
+DB_NAME_SECRET_NAME="$(cfg "$TARGET" db_name_secret_name)"
+DB_NAME_SECRET_NAMESPACE="$(cfg "$TARGET" db_name_secret_namespace)"
 DB_SCHEMA="$(cfg "$TARGET" schema)"
 SECRET_NAME="$(cfg "$TARGET" secret_name)"
 SECRET_NAMESPACE="$(cfg "$TARGET" secret_namespace)"
@@ -212,16 +215,25 @@ USERNAME_SECRET_NAMESPACE="$(cfg "$TARGET" username_secret_namespace)"
 SAFETY="$(cfg "$TARGET" safety)"
 CHANGELOG_REL="$(cfg "$TARGET" changelog_dir)"
 CHANGELOG_FILE="$(cfg "$TARGET" changelog_file)"
-CHANGELOG_DIR="$(resolve_config_path "${CHANGELOG_REL:-repos/gnp-backend/liquibase}")"
-CHANGELOG_FILE="${CHANGELOG_FILE:-changelog-master.yaml}"
-if [[ "$CHANGELOG_FILE" == /* ]]; then
-  CHANGELOG_PATH="$CHANGELOG_FILE"
-  CHANGELOG_PROPERTY="$CHANGELOG_FILE"
-  CHANGELOG_SEARCH_PATH="$(dirname "$CHANGELOG_FILE")"
+HAS_CHANGELOG=false
+if [[ -n "$CHANGELOG_REL" || -n "$CHANGELOG_FILE" ]]; then
+  HAS_CHANGELOG=true
+  CHANGELOG_DIR="$(resolve_config_path "${CHANGELOG_REL:-.}")"
+  CHANGELOG_FILE="${CHANGELOG_FILE:-changelog-master.yaml}"
+  if [[ "$CHANGELOG_FILE" == /* ]]; then
+    CHANGELOG_PATH="$CHANGELOG_FILE"
+    CHANGELOG_PROPERTY="$CHANGELOG_FILE"
+    CHANGELOG_SEARCH_PATH="$(dirname "$CHANGELOG_FILE")"
+  else
+    CHANGELOG_PATH="${CHANGELOG_DIR%/}/$CHANGELOG_FILE"
+    CHANGELOG_PROPERTY="$CHANGELOG_FILE"
+    CHANGELOG_SEARCH_PATH="$CHANGELOG_DIR"
+  fi
 else
-  CHANGELOG_PATH="${CHANGELOG_DIR%/}/$CHANGELOG_FILE"
-  CHANGELOG_PROPERTY="$CHANGELOG_FILE"
-  CHANGELOG_SEARCH_PATH="$CHANGELOG_DIR"
+  CHANGELOG_DIR=""
+  CHANGELOG_PATH=""
+  CHANGELOG_PROPERTY=""
+  CHANGELOG_SEARCH_PATH=""
 fi
 
 SECRET_KEYS=("$SECRET_KEY")
@@ -234,16 +246,26 @@ while IFS= read -r key; do
   [[ -n "$key" ]] && USERNAME_KEYS+=("$key")
 done < <(cfg_list "$TARGET" username_key_fallbacks)
 
+DB_NAME_KEYS=("$DB_NAME_KEY")
+while IFS= read -r key; do
+  [[ -n "$key" ]] && DB_NAME_KEYS+=("$key")
+done < <(cfg_list "$TARGET" db_name_key_fallbacks)
+
 SECRET_NAMESPACE="${SECRET_NAMESPACE:-$NAMESPACE}"
+DB_NAME_SECRET_NAME="${DB_NAME_SECRET_NAME:-$SECRET_NAME}"
+DB_NAME_SECRET_NAMESPACE="${DB_NAME_SECRET_NAMESPACE:-$SECRET_NAMESPACE}"
 USERNAME_SECRET_NAME="${USERNAME_SECRET_NAME:-$SECRET_NAME}"
 USERNAME_SECRET_NAMESPACE="${USERNAME_SECRET_NAMESPACE:-$SECRET_NAMESPACE}"
 DB_SCHEMA="${DB_SCHEMA:-public}"
 SAFETY="${SAFETY:-normal}"
 
 missing=()
-for required in NAMESPACE SVC REMOTE_PORT LOCAL_PORT DB_TYPE DB_NAME SECRET_NAME SECRET_KEY; do
+for required in NAMESPACE SVC REMOTE_PORT LOCAL_PORT DB_TYPE SECRET_NAME SECRET_KEY; do
   [[ -z "${!required}" ]] && missing+=("$required")
 done
+if [[ -z "$DB_NAME" && -z "$DB_NAME_KEY" ]]; then
+  missing+=("db_name or db_name_key")
+fi
 if [[ -z "$DB_USER" && -z "$USERNAME_KEY" ]]; then
   missing+=("username or username_key")
 fi
@@ -277,6 +299,43 @@ check_safety() {
   return 0
 }
 
+args_have_changelog() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --changelog-file|--changelog-file=*|--changeLogFile|--changeLogFile=*|--change-log-file|--change-log-file=*)
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+liquibase_command_from_args() {
+  local arg skip_next=false
+  for arg in "$@"; do
+    if [[ "$skip_next" == true ]]; then
+      skip_next=false
+      continue
+    fi
+
+    case "$arg" in
+      --changelog-file|--changeLogFile|--change-log-file|--url|--username|--password|--defaults-file|--log-level|--contexts|--label-filter|--liquibase-schema-name|--default-schema-name)
+        skip_next=true
+        ;;
+      --*)
+        ;;
+      -*)
+        ;;
+      *)
+        printf '%s' "$arg"
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
 if [[ "$SAFETY" == "readonly" ]]; then
   echo ""
   echo "⚠  Read-only target selected — write operations will be blocked."
@@ -284,7 +343,22 @@ if [[ "$SAFETY" == "readonly" ]]; then
   echo ""
 fi
 
-# --- Fetch password from K8s secret ---
+if [[ "$SHELL_MODE" != true && ${#LB_ARGS[@]} -gt 0 && "$HAS_CHANGELOG" != true ]] && ! args_have_changelog "${LB_ARGS[@]}"; then
+  echo "Target '$TARGET' has no changelog configured."
+  echo "Use --shell for an interactive connection, or pass a Liquibase --changelog-file argument."
+  exit 1
+fi
+
+# --- Fetch connection values from K8s secrets ---
+if [[ -n "$DB_NAME_KEY" ]]; then
+  echo "==> Fetching database name from secret $DB_NAME_SECRET_NAMESPACE/$DB_NAME_SECRET_NAME..."
+  DB_NAME=$(fetch_secret_value_from_keys "$DB_NAME_SECRET_NAMESPACE" "$DB_NAME_SECRET_NAME" "${DB_NAME_KEYS[@]}") || {
+    echo "Failed to read database name from secret $DB_NAME_SECRET_NAME in namespace $DB_NAME_SECRET_NAMESPACE"
+    echo "Tried keys: ${DB_NAME_KEYS[*]}"
+    exit 1
+  }
+fi
+
 if [[ -n "$USERNAME_KEY" ]]; then
   echo "==> Fetching username from secret $USERNAME_SECRET_NAMESPACE/$USERNAME_SECRET_NAME..."
   DB_USER=$(fetch_secret_value_from_keys "$USERNAME_SECRET_NAMESPACE" "$USERNAME_SECRET_NAME" "${USERNAME_KEYS[@]}") || {
@@ -328,9 +402,12 @@ TMPDIR_LB=$(mktemp -d)
 
 if [[ "$DB_TYPE" == "postgresql" ]]; then
   JDBC_URL="jdbc:postgresql://localhost:$LOCAL_PORT/$DB_NAME?currentSchema=$DB_SCHEMA"
-  cat > "$TMPDIR_LB/liquibase.properties" <<PROPS
-changeLogFile=$CHANGELOG_PROPERTY
-searchPath=$CHANGELOG_SEARCH_PATH
+  {
+    if [[ "$HAS_CHANGELOG" == true ]]; then
+      printf 'changeLogFile=%s\n' "$CHANGELOG_PROPERTY"
+      printf 'searchPath=%s\n' "$CHANGELOG_SEARCH_PATH"
+    fi
+    cat <<PROPS
 url=$JDBC_URL
 username=$DB_USER
 password=$DB_PASS
@@ -339,11 +416,15 @@ liquibaseSchemaName=$DB_SCHEMA
 liquibase.hub.mode=off
 liquibase.show-banner=false
 PROPS
+  } > "$TMPDIR_LB/liquibase.properties"
 elif [[ "$DB_TYPE" == "mysql" ]]; then
   JDBC_URL="jdbc:mysql://localhost:$LOCAL_PORT/$DB_NAME"
-  cat > "$TMPDIR_LB/liquibase.properties" <<PROPS
-changeLogFile=$CHANGELOG_PROPERTY
-searchPath=$CHANGELOG_SEARCH_PATH
+  {
+    if [[ "$HAS_CHANGELOG" == true ]]; then
+      printf 'changeLogFile=%s\n' "$CHANGELOG_PROPERTY"
+      printf 'searchPath=%s\n' "$CHANGELOG_SEARCH_PATH"
+    fi
+    cat <<PROPS
 url=$JDBC_URL
 username=$DB_USER
 password=$DB_PASS
@@ -351,6 +432,7 @@ defaultSchemaName=$DB_SCHEMA
 liquibase.hub.mode=off
 liquibase.show-banner=false
 PROPS
+  } > "$TMPDIR_LB/liquibase.properties"
 else
   echo "Unsupported db_type for target '$TARGET': $DB_TYPE"
   echo "Supported types: postgresql, mysql"
@@ -369,7 +451,11 @@ interactive_shell() {
   echo ""
   echo "Dropping into zsh with port-forward active."
   echo "  DB: $DB_TYPE @ localhost:$LOCAL_PORT/$DB_NAME (user: $DB_USER)"
-  echo "  Changelog: $CHANGELOG_PATH"
+  if [[ "$HAS_CHANGELOG" == true ]]; then
+    echo "  Changelog: $CHANGELOG_PATH"
+  else
+    echo "  Changelog: not configured for this target"
+  fi
   echo "  Liquibase properties: $TMPDIR_LB/liquibase.properties"
   echo "  Type 'exit' to close the shell and tear down port-forward."
   echo ""
@@ -382,6 +468,8 @@ interactive_shell() {
   export LB_DB_TYPE="$DB_TYPE"
   export LB_TARGET="$TARGET"
   export LB_DEFAULTS_FILE="$TMPDIR_LB/liquibase.properties"
+  export LB_CHANGELOG_PATH="$CHANGELOG_PATH"
+  export LB_CHANGELOG_DIR="$CHANGELOG_SEARCH_PATH"
   if [[ "$DB_TYPE" == "postgresql" ]]; then
     export PGHOST=localhost PGPORT="$LOCAL_PORT" PGDATABASE="$DB_NAME" PGUSER="$DB_USER" PGPASSWORD="$DB_PASS"
   elif [[ "$DB_TYPE" == "mysql" ]]; then
@@ -394,10 +482,15 @@ if [[ "$SHELL_MODE" == true ]]; then
   interactive_shell
 elif [[ ${#LB_ARGS[@]} -gt 0 ]]; then
   # One-shot mode
-  check_safety "${LB_ARGS[0]}" || exit 1
+  LB_CMD="$(liquibase_command_from_args "${LB_ARGS[@]}" || true)"
+  LB_CMD="${LB_CMD:-${LB_ARGS[0]}}"
+  check_safety "$LB_CMD" || exit 1
   echo "==> Running: liquibase ${LB_ARGS[*]}"
   echo ""
   run_lb "${LB_ARGS[@]}"
+elif [[ "$HAS_CHANGELOG" != true ]]; then
+  echo "Target '$TARGET' has no changelog configured; opening a connection shell."
+  interactive_shell
 else
   # Interactive menu
   echo "Liquibase interactive shell — $TARGET"

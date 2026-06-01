@@ -7,13 +7,14 @@ Interactive Liquibase shell that establishes `kubectl port-forward` to Kubernete
 ## Usage
 
 ```
-liquibase-shell [target] [-- liquibase-args...]
+liquibase-shell [target] [--shell | -- liquibase-args...]
 ```
 
 | Mode | Example | Behavior |
 |------|---------|----------|
 | Interactive | `liquibase-shell prod` | Opens menu with status/update/rollback/etc |
 | One-shot | `liquibase-shell prod -- status` | Runs command, prints output, exits |
+| Shell | `liquibase-shell prod --shell` | Opens a shell with the port-forward and connection env vars active |
 | No target | `liquibase-shell` | Prompts for target selection |
 
 ## Config-Driven Targets
@@ -114,6 +115,20 @@ liquibase_targets:
     username: gnp_migrate
     safety: readonly             # blocks all write ops
     changelog_dir: repos/gnp-backend/liquibase
+
+  shared-postgres:
+    description: "Shared TimescaleDB instance"
+    namespace: data-ns
+    service: svc/shared-postgres
+    remote_port: 5432
+    local_port: 54322
+    db_type: postgresql
+    db_name: postgres
+    schema: public
+    secret_name: data-postgres-secrets
+    secret_key: POSTGRES_PASSWORD
+    username: postgres
+    safety: destructive          # connection-only target; no changelog
 ```
 
 ### Field reference
@@ -126,7 +141,11 @@ liquibase_targets:
 | `remote_port` | yes | Service port to forward |
 | `local_port` | yes | Local port to bind (must be unique across active targets) |
 | `db_type` | yes | `postgresql` or `mysql` — determines JDBC URL format |
-| `db_name` | yes | Database name in JDBC URL |
+| `db_name` | yes* | Database name in JDBC URL. Required unless `db_name_key` is set |
+| `db_name_key` | no | Key within a Secret to extract the database name |
+| `db_name_key_fallbacks` | no | Ordered fallback database-name keys to try if `db_name_key` is absent |
+| `db_name_secret_name` | no | Secret for `db_name_key`. Defaults to `secret_name` |
+| `db_name_secret_namespace` | no | Namespace for `db_name_secret_name`. Defaults to `secret_namespace` |
 | `schema` | yes | Default schema (used for `defaultSchemaName` and `currentSchema`) |
 | `secret_name` | yes | K8s Secret name containing the password |
 | `secret_namespace` | no | Namespace for `secret_name`. Defaults to `namespace` |
@@ -138,11 +157,16 @@ liquibase_targets:
 | `username_secret_name` | no | Secret for `username_key`. Defaults to `secret_name` |
 | `username_secret_namespace` | no | Namespace for `username_secret_name`. Defaults to `secret_namespace` |
 | `safety` | yes | `destructive` / `normal` / `readonly` — controls confirmation gates |
-| `changelog_dir` | no | Path to changelog directory, relative to the config file. Default: `repos/gnp-backend/liquibase` |
-| `changelog_file` | no | Changelog file relative to `changelog_dir`. Default: `changelog-master.yaml` |
+| `changelog_dir` | no | Path to changelog directory, relative to the config file |
+| `changelog_file` | no | Changelog file relative to `changelog_dir`. Defaults to `changelog-master.yaml` only when `changelog_dir` is set |
 
 `username` and `username_key` are mutually substitutable: set one literal
 username, or let the shell read it from a Kubernetes Secret.
+
+`db_name` and `db_name_key` follow the same pattern. Targets without a
+configured changelog are connection-only: `liquibase-shell <target>` opens
+`--shell`, while one-shot Liquibase commands must pass a
+`--changelog-file`/`--changeLogFile` argument.
 
 ### Safety levels
 
@@ -160,13 +184,14 @@ graph TD
     B -->|no| C[Show menu from config]
     B -->|yes| D[Load target from config]
     C --> D
-    D --> E[Fetch password from K8s secret]
+    D --> E[Fetch configured secret-backed fields]
     E --> F[Start kubectl port-forward]
     F --> G{Port ready within 10s?}
     G -->|no| H[Error + exit]
     G -->|yes| I{One-shot args?}
     I -->|yes| J[Check safety gate]
-    I -->|no| K[Interactive menu loop]
+    I -->|no, changelog configured| K[Interactive menu loop]
+    I -->|no changelog| O[Open connection shell]
     J --> L[Run liquibase command]
     K --> J
     L --> M{More commands?}
@@ -200,10 +225,10 @@ Use `yq` to extract target fields from YAML. Example:
 
 ```bash
 # List available targets
-yq -r '.targets | keys[]' "$CONFIG_FILE"
+yq -r '(.liquibase_targets // {}) | keys[]' "$CONFIG_FILE"
 
 # Get a field for a target
-yq -r ".targets.$TARGET.namespace" "$CONFIG_FILE"
+yq -r ".liquibase_targets.$TARGET.namespace" "$CONFIG_FILE"
 ```
 
 This avoids adding a Python/Ruby dependency and stays consistent with the project's existing `yq` usage.
