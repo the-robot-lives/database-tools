@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Interactive Liquibase shell with kubectl port-forward to K8s databases.
-# Loads targets from liquibase-targets.yaml config files.
+# Loads targets from infra-config.yaml config files.
 #
 # Usage: liquibase-shell [target] [--shell | -- liquibase-args...]
 #
@@ -20,11 +20,14 @@
 #   liquibase-shell prod --shell            # drop into free-form liquibase prompt
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+PWD_ROOT="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || true)"
+SCRIPT_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
 
 PF_PID=""
 TMPDIR_LB=""
+BASE64_DECODE_ARGS=()
 
 cleanup() {
   if [[ -n "$PF_PID" ]] && kill -0 "$PF_PID" 2>/dev/null; then
@@ -36,25 +39,42 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # --- Locate config file ---
-find_config() {
-  # Resolve symlinks to find repo root
-  local real_script
-  real_script="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
-  local real_dir="$(cd "$(dirname "$real_script")" && pwd)"
-  local real_repo="$(cd "$real_dir/../../.." 2>/dev/null && pwd)"
+find_config_in_tree() {
+  local start="$1"
+  local dir
+  dir="$(cd "$start" 2>/dev/null && pwd)" || return 1
 
+  while [[ "$dir" != "/" ]]; do
+    if [[ -f "$dir/infra-config.yaml" ]]; then
+      echo "$dir/infra-config.yaml"
+      return 0
+    fi
+    if [[ -f "$dir/.infra-config.yaml" ]]; then
+      echo "$dir/.infra-config.yaml"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+
+find_config() {
   local candidates=(
     "${LIQUIBASE_CONFIG:-}"
     "./infra-config.yaml"
-    "$REPO_ROOT/infra-config.yaml"
-    "$real_repo/infra-config.yaml"
     "./.infra-config.yaml"
-    "$REPO_ROOT/.infra-config.yaml"
-    "$real_repo/.infra-config.yaml"
+    "${PWD_ROOT:+$PWD_ROOT/infra-config.yaml}"
+    "${PWD_ROOT:+$PWD_ROOT/.infra-config.yaml}"
+    "${SCRIPT_ROOT:+$SCRIPT_ROOT/infra-config.yaml}"
+    "${SCRIPT_ROOT:+$SCRIPT_ROOT/.infra-config.yaml}"
   )
   for f in "${candidates[@]}"; do
     [[ -n "$f" && -f "$f" ]] && { echo "$f"; return 0; }
   done
+
+  find_config_in_tree "$PWD" && return 0
+  find_config_in_tree "$SCRIPT_DIR" && return 0
+
   echo "ERROR: No infra-config.yaml found." >&2
   echo "Searched:" >&2
   for f in "${candidates[@]}"; do
@@ -64,6 +84,27 @@ find_config() {
 }
 
 CONFIG_FILE="$(find_config)"
+CONFIG_ROOT="$(cd "$(dirname "$CONFIG_FILE")" && pwd)"
+
+if printf '' | base64 --decode >/dev/null 2>&1; then
+  BASE64_DECODE_ARGS=(--decode)
+elif printf '' | base64 -d >/dev/null 2>&1; then
+  BASE64_DECODE_ARGS=(-d)
+elif printf '' | base64 -D >/dev/null 2>&1; then
+  BASE64_DECODE_ARGS=(-D)
+else
+  echo "ERROR: base64 does not support --decode, -d, or -D on this system." >&2
+  exit 1
+fi
+
+resolve_config_path() {
+  local path="$1"
+  if [[ "$path" == /* ]]; then
+    echo "$path"
+  else
+    echo "$CONFIG_ROOT/$path"
+  fi
+}
 
 # --- Helper: read a target field from config ---
 cfg() {
@@ -71,9 +112,42 @@ cfg() {
   yq -r "(.liquibase_targets.\"$target\".\"$field\" // \"\")" "$CONFIG_FILE"
 }
 
+cfg_list() {
+  local target="$1" field="$2"
+  yq -r "(.liquibase_targets.\"$target\".\"$field\" // [])[]?" "$CONFIG_FILE"
+}
+
 # --- List available targets ---
 list_targets() {
-  yq -r '.liquibase_targets | keys[]' "$CONFIG_FILE"
+  yq -r '(.liquibase_targets // {}) | keys[]' "$CONFIG_FILE"
+}
+
+target_exists() {
+  local target="$1"
+  [[ "$(yq -r "((.liquibase_targets // {}) | has(\"$target\"))" "$CONFIG_FILE")" == "true" ]]
+}
+
+fetch_secret_value() {
+  local namespace="$1" secret_name="$2" secret_key="$3"
+  local encoded
+  encoded="$(kubectl get secret -n "$namespace" "$secret_name" -o jsonpath="{.data.$secret_key}" 2>/dev/null)" || return 1
+  [[ -n "$encoded" ]] || return 1
+  printf '%s' "$encoded" | base64 "${BASE64_DECODE_ARGS[@]}"
+}
+
+fetch_secret_value_from_keys() {
+  local namespace="$1" secret_name="$2"
+  shift 2
+
+  local secret_key value
+  for secret_key in "$@"; do
+    [[ -z "$secret_key" ]] && continue
+    if value="$(fetch_secret_value "$namespace" "$secret_name" "$secret_key")" && [[ -n "$value" ]]; then
+      printf '%s' "$value"
+      return 0
+    fi
+  done
+  return 1
 }
 
 # --- Target selection ---
@@ -85,6 +159,11 @@ else
 fi
 
 if [[ -z "$TARGET" ]]; then
+  if [[ -z "$(list_targets)" ]]; then
+    echo "No liquibase_targets configured in $CONFIG_FILE"
+    exit 1
+  fi
+
   echo "Select a database target:"
   echo ""
   while IFS= read -r t; do
@@ -96,7 +175,7 @@ if [[ -z "$TARGET" ]]; then
 fi
 
 # Validate target exists in config
-if [[ -z "$(cfg "$TARGET" "namespace")" ]]; then
+if ! target_exists "$TARGET"; then
   echo "Unknown target: $TARGET"
   echo "Valid targets: $(list_targets | tr '\n' ' ')"
   exit 1
@@ -124,11 +203,54 @@ DB_TYPE="$(cfg "$TARGET" db_type)"
 DB_NAME="$(cfg "$TARGET" db_name)"
 DB_SCHEMA="$(cfg "$TARGET" schema)"
 SECRET_NAME="$(cfg "$TARGET" secret_name)"
+SECRET_NAMESPACE="$(cfg "$TARGET" secret_namespace)"
 SECRET_KEY="$(cfg "$TARGET" secret_key)"
 DB_USER="$(cfg "$TARGET" username)"
+USERNAME_KEY="$(cfg "$TARGET" username_key)"
+USERNAME_SECRET_NAME="$(cfg "$TARGET" username_secret_name)"
+USERNAME_SECRET_NAMESPACE="$(cfg "$TARGET" username_secret_namespace)"
 SAFETY="$(cfg "$TARGET" safety)"
 CHANGELOG_REL="$(cfg "$TARGET" changelog_dir)"
-CHANGELOG_DIR="$REPO_ROOT/${CHANGELOG_REL:-repos/gnp-backend/liquibase}"
+CHANGELOG_FILE="$(cfg "$TARGET" changelog_file)"
+CHANGELOG_DIR="$(resolve_config_path "${CHANGELOG_REL:-repos/gnp-backend/liquibase}")"
+CHANGELOG_FILE="${CHANGELOG_FILE:-changelog-master.yaml}"
+if [[ "$CHANGELOG_FILE" == /* ]]; then
+  CHANGELOG_PATH="$CHANGELOG_FILE"
+  CHANGELOG_PROPERTY="$CHANGELOG_FILE"
+  CHANGELOG_SEARCH_PATH="$(dirname "$CHANGELOG_FILE")"
+else
+  CHANGELOG_PATH="${CHANGELOG_DIR%/}/$CHANGELOG_FILE"
+  CHANGELOG_PROPERTY="$CHANGELOG_FILE"
+  CHANGELOG_SEARCH_PATH="$CHANGELOG_DIR"
+fi
+
+SECRET_KEYS=("$SECRET_KEY")
+while IFS= read -r key; do
+  [[ -n "$key" ]] && SECRET_KEYS+=("$key")
+done < <(cfg_list "$TARGET" secret_key_fallbacks)
+
+USERNAME_KEYS=("$USERNAME_KEY")
+while IFS= read -r key; do
+  [[ -n "$key" ]] && USERNAME_KEYS+=("$key")
+done < <(cfg_list "$TARGET" username_key_fallbacks)
+
+SECRET_NAMESPACE="${SECRET_NAMESPACE:-$NAMESPACE}"
+USERNAME_SECRET_NAME="${USERNAME_SECRET_NAME:-$SECRET_NAME}"
+USERNAME_SECRET_NAMESPACE="${USERNAME_SECRET_NAMESPACE:-$SECRET_NAMESPACE}"
+DB_SCHEMA="${DB_SCHEMA:-public}"
+SAFETY="${SAFETY:-normal}"
+
+missing=()
+for required in NAMESPACE SVC REMOTE_PORT LOCAL_PORT DB_TYPE DB_NAME SECRET_NAME SECRET_KEY; do
+  [[ -z "${!required}" ]] && missing+=("$required")
+done
+if [[ -z "$DB_USER" && -z "$USERNAME_KEY" ]]; then
+  missing+=("username or username_key")
+fi
+if [[ ${#missing[@]} -gt 0 ]]; then
+  echo "Target '$TARGET' is missing required config: ${missing[*]}"
+  exit 1
+fi
 
 # --- Readonly operations whitelist ---
 READONLY_OPS="status diff validate history update-sql rollback-count-sql changelog-sync-sql"
@@ -163,9 +285,19 @@ if [[ "$SAFETY" == "readonly" ]]; then
 fi
 
 # --- Fetch password from K8s secret ---
-echo "==> Fetching credentials from secret $SECRET_NAME/$SECRET_KEY..."
-DB_PASS=$(kubectl get secret -n "$NAMESPACE" "$SECRET_NAME" -o jsonpath="{.data.$SECRET_KEY}" 2>/dev/null | base64 -d) || {
-  echo "Failed to read secret $SECRET_NAME/$SECRET_KEY in namespace $NAMESPACE"
+if [[ -n "$USERNAME_KEY" ]]; then
+  echo "==> Fetching username from secret $USERNAME_SECRET_NAMESPACE/$USERNAME_SECRET_NAME..."
+  DB_USER=$(fetch_secret_value_from_keys "$USERNAME_SECRET_NAMESPACE" "$USERNAME_SECRET_NAME" "${USERNAME_KEYS[@]}") || {
+    echo "Failed to read username from secret $USERNAME_SECRET_NAME in namespace $USERNAME_SECRET_NAMESPACE"
+    echo "Tried keys: ${USERNAME_KEYS[*]}"
+    exit 1
+  }
+fi
+
+echo "==> Fetching password from secret $SECRET_NAMESPACE/$SECRET_NAME..."
+DB_PASS=$(fetch_secret_value_from_keys "$SECRET_NAMESPACE" "$SECRET_NAME" "${SECRET_KEYS[@]}") || {
+  echo "Failed to read password from secret $SECRET_NAME in namespace $SECRET_NAMESPACE"
+  echo "Tried keys: ${SECRET_KEYS[*]}"
   exit 1
 }
 
@@ -197,7 +329,8 @@ TMPDIR_LB=$(mktemp -d)
 if [[ "$DB_TYPE" == "postgresql" ]]; then
   JDBC_URL="jdbc:postgresql://localhost:$LOCAL_PORT/$DB_NAME?currentSchema=$DB_SCHEMA"
   cat > "$TMPDIR_LB/liquibase.properties" <<PROPS
-changeLogFile=$CHANGELOG_DIR/changelog-master.yaml
+changeLogFile=$CHANGELOG_PROPERTY
+searchPath=$CHANGELOG_SEARCH_PATH
 url=$JDBC_URL
 username=$DB_USER
 password=$DB_PASS
@@ -209,7 +342,8 @@ PROPS
 elif [[ "$DB_TYPE" == "mysql" ]]; then
   JDBC_URL="jdbc:mysql://localhost:$LOCAL_PORT/$DB_NAME"
   cat > "$TMPDIR_LB/liquibase.properties" <<PROPS
-changeLogFile=$CHANGELOG_DIR/changelog-master.yaml
+changeLogFile=$CHANGELOG_PROPERTY
+searchPath=$CHANGELOG_SEARCH_PATH
 url=$JDBC_URL
 username=$DB_USER
 password=$DB_PASS
@@ -217,6 +351,10 @@ defaultSchemaName=$DB_SCHEMA
 liquibase.hub.mode=off
 liquibase.show-banner=false
 PROPS
+else
+  echo "Unsupported db_type for target '$TARGET': $DB_TYPE"
+  echo "Supported types: postgresql, mysql"
+  exit 1
 fi
 
 echo "==> Connected: $DB_TYPE @ localhost:$LOCAL_PORT/$DB_NAME (user: $DB_USER)"
@@ -231,6 +369,7 @@ interactive_shell() {
   echo ""
   echo "Dropping into zsh with port-forward active."
   echo "  DB: $DB_TYPE @ localhost:$LOCAL_PORT/$DB_NAME (user: $DB_USER)"
+  echo "  Changelog: $CHANGELOG_PATH"
   echo "  Liquibase properties: $TMPDIR_LB/liquibase.properties"
   echo "  Type 'exit' to close the shell and tear down port-forward."
   echo ""
@@ -262,7 +401,7 @@ elif [[ ${#LB_ARGS[@]} -gt 0 ]]; then
 else
   # Interactive menu
   echo "Liquibase interactive shell — $TARGET"
-  echo "Changelog: $CHANGELOG_DIR/changelog-master.yaml"
+  echo "Changelog: $CHANGELOG_PATH"
   echo "Config: $CONFIG_FILE"
   echo ""
   while true; do

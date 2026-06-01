@@ -18,9 +18,9 @@ liquibase-shell [target] [-- liquibase-args...]
 
 ## Config-Driven Targets
 
-### Change from current implementation
+### Config source
 
-The current script hardcodes targets in a bash associative array. The new version loads targets from a YAML config file, allowing:
+The script loads targets from a YAML config file, allowing:
 
 - New targets added without modifying the script
 - Per-project override configs
@@ -129,10 +129,20 @@ liquibase_targets:
 | `db_name` | yes | Database name in JDBC URL |
 | `schema` | yes | Default schema (used for `defaultSchemaName` and `currentSchema`) |
 | `secret_name` | yes | K8s Secret name containing the password |
+| `secret_namespace` | no | Namespace for `secret_name`. Defaults to `namespace` |
 | `secret_key` | yes | Key within the Secret to extract |
-| `username` | yes | Database username |
+| `secret_key_fallbacks` | no | Ordered fallback password keys to try if `secret_key` is absent |
+| `username` | yes* | Database username. Required unless `username_key` is set |
+| `username_key` | no | Key within a Secret to extract the database username |
+| `username_key_fallbacks` | no | Ordered fallback username keys to try if `username_key` is absent |
+| `username_secret_name` | no | Secret for `username_key`. Defaults to `secret_name` |
+| `username_secret_namespace` | no | Namespace for `username_secret_name`. Defaults to `secret_namespace` |
 | `safety` | yes | `destructive` / `normal` / `readonly` — controls confirmation gates |
-| `changelog_dir` | no | Path to changelog (relative to repo root). Default: `repos/gnp-backend/liquibase` |
+| `changelog_dir` | no | Path to changelog directory, relative to the config file. Default: `repos/gnp-backend/liquibase` |
+| `changelog_file` | no | Changelog file relative to `changelog_dir`. Default: `changelog-master.yaml` |
+
+`username` and `username_key` are mutually substitutable: set one literal
+username, or let the shell read it from a Kubernetes Secret.
 
 ### Safety levels
 
