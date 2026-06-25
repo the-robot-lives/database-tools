@@ -20,6 +20,14 @@
 #   liquibase-shell prod --shell            # drop into free-form liquibase prompt
 set -euo pipefail
 
+# Default KUBECONFIG to the noizu cluster config when the caller hasn't set one,
+# so the secret/port-forward kubectl calls reach the right cluster. Without this
+# the password fetch silently fails ("Tried keys: DB_PASSWORD") against whatever
+# default context the shell happens to have.
+if [[ -z "${KUBECONFIG:-}" && -f "$HOME/.kube/noizu/config" ]]; then
+  export KUBECONFIG="$HOME/.kube/noizu/config"
+fi
+
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 PWD_ROOT="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || true)"
