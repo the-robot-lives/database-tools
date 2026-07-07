@@ -1,34 +1,57 @@
 #!/usr/bin/env bash
-# Provision a Postgres database + login role on a running cluster instance.
+# Provision a Postgres database + login role (and optionally a Valkey/Redis ACL
+# user) on running cluster instances.
 #
 # A running timescaledb/postgres instance only runs its initdb.d/ scripts on the
 # FIRST init of an empty data dir. Apps added after that (new initdb.d/<app>/
-# entry) never get their database/role created on the live instance. This tool
-# does that create-db-and-role step against a running instance, on demand.
+# entry) never get their database/role created on the live instance. Likewise a
+# Valkey app added after the valkey pod started never gets its ACL user (the
+# app-valkey users come from the deployment's `--user` args, applied at pod
+# start). This tool does those create-on-a-running-instance steps on demand.
 #
 # Credential model (matches how the cluster actually stores them):
-#   * ROLE creds ("perms") come from dc  — the declarative source of truth,
-#     the same value that syncs into the app's K8s secret via Infisical.
-#   * SUPERUSER creds come from the live K8s admin secret — the auto-generated
-#     instance password is NOT pinned in dc (drifts), so the live secret is the
-#     only reliable source for connecting as admin.
+#   * ROLE / ACL-USER creds ("perms") come from dc — the declarative source of
+#     truth, the same value that syncs into the app's K8s secret via Infisical.
+#   * SUPERUSER / default-user creds come from the live K8s admin secret — the
+#     auto-generated instance password is NOT pinned in dc (drifts), so the live
+#     secret is the only reliable source for connecting as admin.
 #
 # Config: reuses the `liquibase_targets.<target>` block in .infra-config.yaml for
 # connection details (namespace/service/ports/db_name/username), plus these
 # optional provisioning fields on the same target:
 #
-#   role_password_dc: "services apps.ddi_db_password"  # dc addr for role pw (required)
-#   role_user_dc:     "services apps.ddi_db_user"      # dc addr for role name (optional; else `username`)
-#   admin_secret:     app-timescaledb-secrets          # K8s secret w/ superuser creds (default)
-#   admin_user_key:   POSTGRES_USER                    # key in admin_secret (default)
-#   admin_password_key: POSTGRES_PASSWORD              # key in admin_secret (default)
-#   admin_namespace:  <namespace>                      # ns of admin_secret (default: target namespace)
+#   Postgres (role/db):
+#     role_password_dc: "services apps.ddi_db_password"  # dc addr for role pw (required for --db)
+#     role_user_dc:     "services apps.ddi_db_user"      # dc addr for role name (optional; else `username`)
+#     admin_secret:     app-timescaledb-secrets          # K8s secret w/ superuser creds (default)
+#     admin_user_key:   POSTGRES_USER                    # key in admin_secret (default)
+#     admin_password_key: POSTGRES_PASSWORD              # key in admin_secret (default)
+#     admin_namespace:  <namespace>                      # ns of admin_secret (default: target namespace)
+#
+#   Redis/Valkey (ACL user) — provisioned only when `redis_password_dc` is set:
+#     redis_password_dc:  "auto ddi_valkey_password"     # dc addr for the ACL user pw (enables redis)
+#     redis_service:      svc/app-valkey                 # valkey service (default: svc/app-valkey)
+#     redis_user:         ddi                            # ACL username (default: target `username`)
+#     redis_namespace:    apps                           # ns of the valkey service (default: target ns)
+#     redis_port:         6379                           # remote port (default 6379)
+#     redis_local_port:   56379                          # local forward port (default 56379)
+#     redis_acl_rules:    "~* &* +@all"                  # ACL rules (default: full access)
+#     redis_admin_secret: app-valkey-secrets             # K8s secret w/ default-user pw (default)
+#     redis_admin_password_key: VALKEY_PASSWORD          # key in redis_admin_secret (default)
+#     redis_admin_namespace: <namespace>                 # ns of redis_admin_secret (default: redis ns)
+#
+#   NOTE: a live `ACL SETUSER` on app-valkey takes effect immediately but is lost
+#   when the valkey pod restarts (its users come from `--user` deployment args).
+#   For durability add the user to the app-valkey module's `acl_users` map in
+#   terraform/kubernetes/apps/init/main.tf + a <APP>_VALKEY_PASSWORD in /apps/valkey.
 #
 # Usage:
-#   provision-db <target> [--dry-run]
+#   provision-db <target> [--dry-run]        # provision db/role, and redis if configured
+#   provision-db <target> --redis-only       # only the Valkey ACL user (db already set up)
+#   provision-db <target> --skip-redis       # only the Postgres db/role
 #   provision-db --list
 #
-# Dependencies: yq (v4+), kubectl, psql, dc
+# Dependencies: yq (v4+), kubectl, dc; psql (for db); redis-cli (for redis).
 set -euo pipefail
 
 # --assist: AI-powered help (consistent with other secret/db utilities)
@@ -45,18 +68,16 @@ PWD_ROOT="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || true)"
 SCRIPT_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
 
 PF_PID=""
+REDIS_PF_PID=""
 cleanup() {
-  if [[ -n "$PF_PID" ]] && kill -0 "$PF_PID" 2>/dev/null; then
-    kill "$PF_PID" 2>/dev/null
-    wait "$PF_PID" 2>/dev/null || true
-  fi
+  for pid in "$PF_PID" "$REDIS_PF_PID"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
 }
 trap cleanup EXIT INT TERM
-
-# --- Dependencies ---
-for cmd in yq kubectl psql dc; do
-  command -v "$cmd" &>/dev/null || { echo "❌  $cmd required but not found." >&2; exit 1; }
-done
 
 # --- base64 decode flavor ---
 if printf '' | base64 --decode >/dev/null 2>&1; then B64=(--decode)
@@ -88,6 +109,7 @@ find_config() {
 CONFIG_FILE="$(find_config)"
 
 cfg() { yq -r "(.liquibase_targets.\"$1\".\"$2\" // \"\")" "$CONFIG_FILE"; }
+cfg_list() { yq -r "(.liquibase_targets.\"$1\".\"$2\" // [])[]?" "$CONFIG_FILE"; }
 list_targets() { yq -r '(.liquibase_targets // {}) | keys[]' "$CONFIG_FILE"; }
 target_exists() { [[ "$(yq -r "((.liquibase_targets // {}) | has(\"$1\"))" "$CONFIG_FILE")" == "true" ]]; }
 
@@ -106,20 +128,36 @@ dc_reveal() {
   dc get "$subject" "$rest" --reveal --raw 2>/dev/null
 }
 
+# Wait for a local port to accept connections (port-forward readiness).
+wait_for_port() {
+  local lport="$1" pid="$2"
+  for _ in {1..20}; do
+    nc -z localhost "$lport" 2>/dev/null && return 0
+    kill -0 "$pid" 2>/dev/null || return 1
+    sleep 0.5
+  done
+  nc -z localhost "$lport" 2>/dev/null
+}
+
 # --- Args ---
 DRY_RUN=false
+DO_DB=true
+DO_REDIS=true          # only actually runs if the target has redis_password_dc
 TARGET=""
 for arg in "$@"; do
   case "$arg" in
     --list) list_targets; exit 0 ;;
     --dry-run) DRY_RUN=true ;;
-    --help|-h) sed -n '2,40p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --redis-only) DO_DB=false; DO_REDIS=true ;;
+    --skip-redis) DO_REDIS=false ;;
+    --db-only)    DO_REDIS=false ;;   # alias for --skip-redis
+    --help|-h) sed -n '2,55p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "Unknown flag: $arg" >&2; exit 1 ;;
     *) TARGET="$arg" ;;
   esac
 done
 
-[[ -z "$TARGET" ]] && { echo "Usage: provision-db <target> [--dry-run]"; echo "Targets: $(list_targets | tr '\n' ' ')"; exit 1; }
+[[ -z "$TARGET" ]] && { echo "Usage: provision-db <target> [--dry-run] [--redis-only|--skip-redis]"; echo "Targets: $(list_targets | tr '\n' ' ')"; exit 1; }
 target_exists "$TARGET" || { echo "Unknown target: $TARGET"; echo "Valid: $(list_targets | tr '\n' ' ')"; exit 1; }
 
 # --- Resolve connection + provisioning config ---
@@ -138,82 +176,174 @@ ADMIN_SECRET="$(cfg "$TARGET" admin_secret)"; ADMIN_SECRET="${ADMIN_SECRET:-app-
 ADMIN_USER_KEY="$(cfg "$TARGET" admin_user_key)"; ADMIN_USER_KEY="${ADMIN_USER_KEY:-POSTGRES_USER}"
 ADMIN_PASS_KEY="$(cfg "$TARGET" admin_password_key)"; ADMIN_PASS_KEY="${ADMIN_PASS_KEY:-POSTGRES_PASSWORD}"
 ADMIN_NS="$(cfg "$TARGET" admin_namespace)"; ADMIN_NS="${ADMIN_NS:-$NAMESPACE}"
+mapfile -t EXTENSIONS < <(cfg_list "$TARGET" extensions)
+
+# --- Redis/Valkey ACL user config (optional; enabled by redis_password_dc) ---
+REDIS_PASS_DC="$(cfg "$TARGET" redis_password_dc)"
+REDIS_ENABLED=false
+if $DO_REDIS && [[ -n "$REDIS_PASS_DC" ]]; then REDIS_ENABLED=true; fi
+REDIS_SERVICE="$(cfg "$TARGET" redis_service)"; REDIS_SERVICE="${REDIS_SERVICE:-svc/app-valkey}"
+REDIS_USER="$(cfg "$TARGET" redis_user)"; REDIS_USER="${REDIS_USER:-$ROLE_USER}"
+REDIS_NS="$(cfg "$TARGET" redis_namespace)"; REDIS_NS="${REDIS_NS:-$NAMESPACE}"
+REDIS_PORT="$(cfg "$TARGET" redis_port)"; REDIS_PORT="${REDIS_PORT:-6379}"
+REDIS_LOCAL_PORT="$(cfg "$TARGET" redis_local_port)"; REDIS_LOCAL_PORT="${REDIS_LOCAL_PORT:-56379}"
+REDIS_RULES="$(cfg "$TARGET" redis_acl_rules)"; REDIS_RULES="${REDIS_RULES:-~* &* +@all}"
+REDIS_ADMIN_SECRET="$(cfg "$TARGET" redis_admin_secret)"; REDIS_ADMIN_SECRET="${REDIS_ADMIN_SECRET:-app-valkey-secrets}"
+REDIS_ADMIN_PASS_KEY="$(cfg "$TARGET" redis_admin_password_key)"; REDIS_ADMIN_PASS_KEY="${REDIS_ADMIN_PASS_KEY:-VALKEY_PASSWORD}"
+REDIS_ADMIN_NS="$(cfg "$TARGET" redis_admin_namespace)"; REDIS_ADMIN_NS="${REDIS_ADMIN_NS:-$REDIS_NS}"
+
+# --- Dependency check (scoped to what will actually run) ---
+deps=(yq kubectl dc nc)
+$DO_DB && deps+=(psql)
+$REDIS_ENABLED && deps+=(redis-cli)
+for cmd in "${deps[@]}"; do
+  command -v "$cmd" &>/dev/null || { echo "❌  $cmd required but not found." >&2; exit 1; }
+done
 
 # role user: dc override, else target username
 [[ -n "$ROLE_USER_DC" ]] && ROLE_USER="$(dc_reveal "$ROLE_USER_DC")"
-[[ -z "$ROLE_PASS_DC" ]] && { echo "❌  target '$TARGET' missing 'role_password_dc' (dc address for the role password)." >&2; exit 1; }
 
-missing=()
-for v in NAMESPACE SERVICE DB_NAME ROLE_USER; do [[ -z "${!v}" ]] && missing+=("$v"); done
-[[ ${#missing[@]} -gt 0 ]] && { echo "❌  target '$TARGET' missing: ${missing[*]}" >&2; exit 1; }
+if $DO_DB; then
+  [[ -z "$ROLE_PASS_DC" ]] && { echo "❌  target '$TARGET' missing 'role_password_dc' (dc address for the role password)." >&2; exit 1; }
+  missing=()
+  for v in NAMESPACE SERVICE DB_NAME ROLE_USER; do [[ -z "${!v}" ]] && missing+=("$v"); done
+  [[ ${#missing[@]} -gt 0 ]] && { echo "❌  target '$TARGET' missing: ${missing[*]}" >&2; exit 1; }
+fi
+if ! $DO_DB && ! $REDIS_ENABLED; then
+  echo "❌  --redis-only was given but target '$TARGET' has no 'redis_password_dc'." >&2; exit 1
+fi
 
-echo "── Provision DB [$TARGET] ──"
-echo "  instance : $SERVICE (ns=$NAMESPACE) :$REMOTE_PORT"
-echo "  database : $DB_NAME"
-echo "  role     : $ROLE_USER  (pw from dc: $ROLE_PASS_DC)"
-echo "  admin    : $ADMIN_USER_KEY @ $ADMIN_NS/$ADMIN_SECRET"
-
-# --- Fetch credentials ---
-ADMIN_USER="$(fetch_secret_value "$ADMIN_NS" "$ADMIN_SECRET" "$ADMIN_USER_KEY")" \
-  || { echo "❌  couldn't read $ADMIN_USER_KEY from $ADMIN_NS/$ADMIN_SECRET" >&2; exit 1; }
-ADMIN_PASS="$(fetch_secret_value "$ADMIN_NS" "$ADMIN_SECRET" "$ADMIN_PASS_KEY")" \
-  || { echo "❌  couldn't read $ADMIN_PASS_KEY from $ADMIN_NS/$ADMIN_SECRET" >&2; exit 1; }
-ROLE_PASS="$(dc_reveal "$ROLE_PASS_DC")"
-[[ -z "$ROLE_PASS" ]] && { echo "❌  role password empty from dc '$ROLE_PASS_DC'" >&2; exit 1; }
+echo "── Provision [$TARGET] ──"
+$DO_DB && {
+  echo "  postgres : $SERVICE (ns=$NAMESPACE) :$REMOTE_PORT  db=$DB_NAME  role=$ROLE_USER"
+  echo "             (role pw from dc: $ROLE_PASS_DC; admin $ADMIN_USER_KEY @ $ADMIN_NS/$ADMIN_SECRET)"
+}
+$REDIS_ENABLED && {
+  echo "  valkey   : $REDIS_SERVICE (ns=$REDIS_NS) :$REDIS_PORT  acl-user=$REDIS_USER  rules='$REDIS_RULES'"
+  echo "             (user pw from dc: $REDIS_PASS_DC; admin $REDIS_ADMIN_PASS_KEY @ $REDIS_ADMIN_NS/$REDIS_ADMIN_SECRET)"
+}
 
 if $DRY_RUN; then
   echo ""
   echo "🔍  DRY RUN — would (idempotently):"
-  echo "     CREATE DATABASE $DB_NAME (if absent)"
-  echo "     CREATE/ALTER ROLE $ROLE_USER WITH LOGIN PASSWORD '***' (from dc)"
-  echo "     GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $ROLE_USER"
-  echo "     GRANT ALL ON SCHEMA $DB_SCHEMA + default privileges TO $ROLE_USER"
+  $DO_DB && {
+    echo "     CREATE DATABASE $DB_NAME (if absent)"
+    echo "     CREATE/ALTER ROLE $ROLE_USER WITH LOGIN PASSWORD '***' (from dc)"
+    echo "     GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $ROLE_USER"
+    echo "     GRANT ALL ON SCHEMA $DB_SCHEMA + default privileges TO $ROLE_USER"
+    [[ ${#EXTENSIONS[@]} -gt 0 ]] && echo "     CREATE EXTENSION IF NOT EXISTS (as superuser): ${EXTENSIONS[*]}"
+  }
+  $REDIS_ENABLED && \
+    echo "     ACL SETUSER $REDIS_USER reset on >*** $REDIS_RULES  (on $REDIS_SERVICE, then verify AUTH)"
   exit 0
 fi
 
-# --- Port-forward ---
-echo ""
-echo "==> Port-forward $SERVICE:$REMOTE_PORT → localhost:$LOCAL_PORT"
-kubectl port-forward -n "$NAMESPACE" "$SERVICE" "$LOCAL_PORT:$REMOTE_PORT" &>/dev/null &
-PF_PID=$!
-for _ in {1..20}; do
-  nc -z localhost "$LOCAL_PORT" 2>/dev/null && break
-  kill -0 "$PF_PID" 2>/dev/null || { echo "❌  port-forward died (is $SERVICE in $NAMESPACE?)"; exit 1; }
-  sleep 0.5
-done
-nc -z localhost "$LOCAL_PORT" 2>/dev/null || { echo "❌  timed out waiting for port-forward"; exit 1; }
+# ==========================================================================
+# Postgres provisioning
+# ==========================================================================
+if $DO_DB; then
+  ADMIN_USER="$(fetch_secret_value "$ADMIN_NS" "$ADMIN_SECRET" "$ADMIN_USER_KEY")" \
+    || { echo "❌  couldn't read $ADMIN_USER_KEY from $ADMIN_NS/$ADMIN_SECRET" >&2; exit 1; }
+  ADMIN_PASS="$(fetch_secret_value "$ADMIN_NS" "$ADMIN_SECRET" "$ADMIN_PASS_KEY")" \
+    || { echo "❌  couldn't read $ADMIN_PASS_KEY from $ADMIN_NS/$ADMIN_SECRET" >&2; exit 1; }
+  ROLE_PASS="$(dc_reveal "$ROLE_PASS_DC")"
+  [[ -z "$ROLE_PASS" ]] && { echo "❌  role password empty from dc '$ROLE_PASS_DC'" >&2; exit 1; }
 
-# --- DDL (idempotent; mirrors initdb.d/_lib.sh create_db) ---
-export PGHOST=localhost PGPORT="$LOCAL_PORT" PGUSER="$ADMIN_USER" PGPASSWORD="$ADMIN_PASS"
-psql_admin() { psql -v ON_ERROR_STOP=1 -qtA "$@"; }
+  echo ""
+  echo "==> Port-forward $SERVICE:$REMOTE_PORT → localhost:$LOCAL_PORT"
+  kubectl port-forward -n "$NAMESPACE" "$SERVICE" "$LOCAL_PORT:$REMOTE_PORT" &>/dev/null &
+  PF_PID=$!
+  wait_for_port "$LOCAL_PORT" "$PF_PID" || { echo "❌  port-forward to $SERVICE failed"; exit 1; }
 
-pass_esc="${ROLE_PASS//\'/\'\'}"
+  export PGHOST=localhost PGPORT="$LOCAL_PORT" PGUSER="$ADMIN_USER" PGPASSWORD="$ADMIN_PASS"
+  psql_admin() { psql -v ON_ERROR_STOP=1 -qtA "$@"; }
+  pass_esc="${ROLE_PASS//\'/\'\'}"
 
-echo "==> Ensuring database '$DB_NAME'"
-if [[ "$(psql_admin -d postgres -c "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'")" != "1" ]]; then
-  psql_admin -d postgres -c "CREATE DATABASE \"$DB_NAME\""
-  echo "    created."
-else
-  echo "    exists."
+  echo "==> Ensuring database '$DB_NAME'"
+  if [[ "$(psql_admin -d postgres -c "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'")" != "1" ]]; then
+    psql_admin -d postgres -c "CREATE DATABASE \"$DB_NAME\""
+    echo "    created."
+  else
+    echo "    exists."
+  fi
+
+  echo "==> Ensuring role '$ROLE_USER'"
+  if [[ "$(psql_admin -d postgres -c "SELECT 1 FROM pg_roles WHERE rolname='$ROLE_USER'")" != "1" ]]; then
+    psql_admin -d postgres -c "CREATE ROLE \"$ROLE_USER\" WITH LOGIN PASSWORD '$pass_esc'"
+    echo "    created."
+  else
+    psql_admin -d postgres -c "ALTER ROLE \"$ROLE_USER\" WITH LOGIN PASSWORD '$pass_esc'"
+    echo "    exists (password synced to dc)."
+  fi
+
+  echo "==> Granting privileges"
+  psql_admin -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE \"$DB_NAME\" TO \"$ROLE_USER\""
+  psql_admin -d "$DB_NAME" -c "
+    GRANT ALL ON SCHEMA $DB_SCHEMA TO \"$ROLE_USER\";
+    ALTER DEFAULT PRIVILEGES IN SCHEMA $DB_SCHEMA GRANT ALL ON TABLES TO \"$ROLE_USER\";
+    ALTER DEFAULT PRIVILEGES IN SCHEMA $DB_SCHEMA GRANT ALL ON SEQUENCES TO \"$ROLE_USER\";
+  "
+
+  if [[ ${#EXTENSIONS[@]} -gt 0 ]]; then
+    echo "==> Ensuring extensions (as superuser): ${EXTENSIONS[*]}"
+    for ext in "${EXTENSIONS[@]}"; do
+      [[ -z "$ext" ]] && continue
+      psql_admin -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS \"$ext\""
+      echo "    $ext ✓"
+    done
+  fi
+
+  # release the PG port-forward before the redis step
+  if [[ -n "$PF_PID" ]] && kill -0 "$PF_PID" 2>/dev/null; then kill "$PF_PID" 2>/dev/null; wait "$PF_PID" 2>/dev/null || true; fi
+  PF_PID=""
+  echo ""
+  echo "✅  Provisioned $DB_NAME / $ROLE_USER on $SERVICE ($NAMESPACE)."
 fi
 
-echo "==> Ensuring role '$ROLE_USER'"
-if [[ "$(psql_admin -d postgres -c "SELECT 1 FROM pg_roles WHERE rolname='$ROLE_USER'")" != "1" ]]; then
-  psql_admin -d postgres -c "CREATE ROLE \"$ROLE_USER\" WITH LOGIN PASSWORD '$pass_esc'"
-  echo "    created."
-else
-  psql_admin -d postgres -c "ALTER ROLE \"$ROLE_USER\" WITH LOGIN PASSWORD '$pass_esc'"
-  echo "    exists (password synced to dc)."
+# ==========================================================================
+# Valkey / Redis ACL user provisioning
+# ==========================================================================
+if $REDIS_ENABLED; then
+  REDIS_ADMIN_PASS="$(fetch_secret_value "$REDIS_ADMIN_NS" "$REDIS_ADMIN_SECRET" "$REDIS_ADMIN_PASS_KEY")" \
+    || { echo "❌  couldn't read $REDIS_ADMIN_PASS_KEY from $REDIS_ADMIN_NS/$REDIS_ADMIN_SECRET" >&2; exit 1; }
+  REDIS_USER_PASS="$(dc_reveal "$REDIS_PASS_DC")"
+  [[ -z "$REDIS_USER_PASS" ]] && { echo "❌  redis user password empty from dc '$REDIS_PASS_DC'" >&2; exit 1; }
+
+  echo ""
+  echo "==> Port-forward $REDIS_SERVICE:$REDIS_PORT → localhost:$REDIS_LOCAL_PORT"
+  kubectl port-forward -n "$REDIS_NS" "$REDIS_SERVICE" "$REDIS_LOCAL_PORT:$REDIS_PORT" &>/dev/null &
+  REDIS_PF_PID=$!
+  wait_for_port "$REDIS_LOCAL_PORT" "$REDIS_PF_PID" || { echo "❌  port-forward to $REDIS_SERVICE failed"; exit 1; }
+
+  rcli_admin() { redis-cli -h localhost -p "$REDIS_LOCAL_PORT" --no-auth-warning -a "$REDIS_ADMIN_PASS" "$@"; }
+
+  # sanity: can we auth as the default user?
+  if [[ "$(rcli_admin PING 2>/dev/null)" != "PONG" ]]; then
+    echo "❌  cannot authenticate to $REDIS_SERVICE as the default user (check $REDIS_ADMIN_SECRET/$REDIS_ADMIN_PASS_KEY)" >&2
+    exit 1
+  fi
+
+  echo "==> Ensuring ACL user '$REDIS_USER' (rules: $REDIS_RULES)"
+  # `reset` clears any prior state (old passwords/rules), then re-enable with the
+  # dc password + rules. Rules are intentionally word-split into ACL tokens.
+  # shellcheck disable=SC2086
+  set_out="$(rcli_admin ACL SETUSER "$REDIS_USER" reset on ">${REDIS_USER_PASS}" $REDIS_RULES 2>&1)" || {
+    echo "❌  ACL SETUSER failed: $set_out" >&2; exit 1; }
+  echo "    set."
+  rcli_admin ACL SAVE >/dev/null 2>&1 || true   # no-op if instance has no aclfile
+
+  echo "==> Verifying '$REDIS_USER' can authenticate"
+  ping_out="$(redis-cli -h localhost -p "$REDIS_LOCAL_PORT" --no-auth-warning --user "$REDIS_USER" -a "$REDIS_USER_PASS" PING 2>&1)"
+  if [[ "$ping_out" != "PONG" ]]; then
+    echo "❌  auth check failed for user '$REDIS_USER': $ping_out" >&2; exit 1
+  fi
+  echo "    PONG ✓"
+
+  echo ""
+  echo "✅  Provisioned Valkey ACL user '$REDIS_USER' on $REDIS_SERVICE ($REDIS_NS)."
+  echo "    ⚠  Live-only: this user is dropped if the valkey pod restarts. For durability"
+  echo "       add it to the app-valkey module's acl_users in"
+  echo "       terraform/kubernetes/apps/init/main.tf + a <APP>_VALKEY_PASSWORD in /apps/valkey."
 fi
 
-echo "==> Granting privileges"
-psql_admin -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE \"$DB_NAME\" TO \"$ROLE_USER\""
-psql_admin -d "$DB_NAME" -c "
-  GRANT ALL ON SCHEMA $DB_SCHEMA TO \"$ROLE_USER\";
-  ALTER DEFAULT PRIVILEGES IN SCHEMA $DB_SCHEMA GRANT ALL ON TABLES TO \"$ROLE_USER\";
-  ALTER DEFAULT PRIVILEGES IN SCHEMA $DB_SCHEMA GRANT ALL ON SEQUENCES TO \"$ROLE_USER\";
-"
-
-echo ""
-echo "✅  Provisioned $DB_NAME / $ROLE_USER on $SERVICE ($NAMESPACE)."
-echo "    Next: liquibase-shell $TARGET -- update"
+$DO_DB && echo "    Next: liquibase-shell $TARGET -- update"
