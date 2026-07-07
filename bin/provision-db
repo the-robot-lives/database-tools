@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# Provision a Postgres database + login role on a running cluster instance.
+#
+# A running timescaledb/postgres instance only runs its initdb.d/ scripts on the
+# FIRST init of an empty data dir. Apps added after that (new initdb.d/<app>/
+# entry) never get their database/role created on the live instance. This tool
+# does that create-db-and-role step against a running instance, on demand.
+#
+# Credential model (matches how the cluster actually stores them):
+#   * ROLE creds ("perms") come from dc  — the declarative source of truth,
+#     the same value that syncs into the app's K8s secret via Infisical.
+#   * SUPERUSER creds come from the live K8s admin secret — the auto-generated
+#     instance password is NOT pinned in dc (drifts), so the live secret is the
+#     only reliable source for connecting as admin.
+#
+# Config: reuses the `liquibase_targets.<target>` block in .infra-config.yaml for
+# connection details (namespace/service/ports/db_name/username), plus these
+# optional provisioning fields on the same target:
+#
+#   role_password_dc: "services apps.ddi_db_password"  # dc addr for role pw (required)
+#   role_user_dc:     "services apps.ddi_db_user"      # dc addr for role name (optional; else `username`)
+#   admin_secret:     app-timescaledb-secrets          # K8s secret w/ superuser creds (default)
+#   admin_user_key:   POSTGRES_USER                    # key in admin_secret (default)
+#   admin_password_key: POSTGRES_PASSWORD              # key in admin_secret (default)
+#   admin_namespace:  <namespace>                      # ns of admin_secret (default: target namespace)
+#
+# Usage:
+#   provision-db <target> [--dry-run]
+#   provision-db --list
+#
+# Dependencies: yq (v4+), kubectl, psql, dc
+set -euo pipefail
+
+# --assist: AI-powered help (consistent with other secret/db utilities)
+_K8_ASSIST_LIB="${K8_LIB_DIR:-${HOME}/.local/share/k8-lib}/bin/assist.sh"
+[[ -f "$_K8_ASSIST_LIB" ]] && { source "$_K8_ASSIST_LIB"; _k8_check_assist "$0" "$@"; }
+
+if [[ -z "${KUBECONFIG:-}" && -f "$HOME/.kube/noizu/config" ]]; then
+  export KUBECONFIG="$HOME/.kube/noizu/config"
+fi
+
+SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+PWD_ROOT="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || true)"
+SCRIPT_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+
+PF_PID=""
+cleanup() {
+  if [[ -n "$PF_PID" ]] && kill -0 "$PF_PID" 2>/dev/null; then
+    kill "$PF_PID" 2>/dev/null
+    wait "$PF_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+# --- Dependencies ---
+for cmd in yq kubectl psql dc; do
+  command -v "$cmd" &>/dev/null || { echo "❌  $cmd required but not found." >&2; exit 1; }
+done
+
+# --- base64 decode flavor ---
+if printf '' | base64 --decode >/dev/null 2>&1; then B64=(--decode)
+elif printf '' | base64 -d >/dev/null 2>&1; then B64=(-d)
+elif printf '' | base64 -D >/dev/null 2>&1; then B64=(-D)
+else echo "❌  base64 lacks --decode/-d/-D." >&2; exit 1; fi
+
+# --- Locate config (mirror liquibase-shell resolution) ---
+find_config_in_tree() {
+  local dir; dir="$(cd "$1" 2>/dev/null && pwd)" || return 1
+  while [[ "$dir" != "/" ]]; do
+    [[ -f "$dir/infra-config.yaml" ]] && { echo "$dir/infra-config.yaml"; return 0; }
+    [[ -f "$dir/.infra-config.yaml" ]] && { echo "$dir/.infra-config.yaml"; return 0; }
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+find_config() {
+  local candidates=(
+    "${LIQUIBASE_CONFIG:-}" "${INFRA_CONFIG:-}"
+    "./infra-config.yaml" "./.infra-config.yaml"
+    "${PWD_ROOT:+$PWD_ROOT/.infra-config.yaml}" "${SCRIPT_ROOT:+$SCRIPT_ROOT/.infra-config.yaml}"
+  )
+  for f in "${candidates[@]}"; do [[ -n "$f" && -f "$f" ]] && { echo "$f"; return 0; }; done
+  find_config_in_tree "$PWD" && return 0
+  find_config_in_tree "$SCRIPT_DIR" && return 0
+  echo "ERROR: No infra-config.yaml found." >&2; return 1
+}
+CONFIG_FILE="$(find_config)"
+
+cfg() { yq -r "(.liquibase_targets.\"$1\".\"$2\" // \"\")" "$CONFIG_FILE"; }
+list_targets() { yq -r '(.liquibase_targets // {}) | keys[]' "$CONFIG_FILE"; }
+target_exists() { [[ "$(yq -r "((.liquibase_targets // {}) | has(\"$1\"))" "$CONFIG_FILE")" == "true" ]]; }
+
+fetch_secret_value() {
+  local ns="$1" name="$2" key="$3" enc
+  enc="$(kubectl get secret -n "$ns" "$name" -o jsonpath="{.data.$key}" 2>/dev/null)" || return 1
+  [[ -n "$enc" ]] || return 1
+  printf '%s' "$enc" | base64 "${B64[@]}"
+}
+
+# dc address string ("subject path.to.key") -> revealed raw value
+dc_reveal() {
+  local addr="$1" subject rest
+  read -r subject rest <<< "$addr"
+  [[ -z "$subject" || -z "$rest" ]] && return 1
+  dc get "$subject" "$rest" --reveal --raw 2>/dev/null
+}
+
+# --- Args ---
+DRY_RUN=false
+TARGET=""
+for arg in "$@"; do
+  case "$arg" in
+    --list) list_targets; exit 0 ;;
+    --dry-run) DRY_RUN=true ;;
+    --help|-h) sed -n '2,40p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) echo "Unknown flag: $arg" >&2; exit 1 ;;
+    *) TARGET="$arg" ;;
+  esac
+done
+
+[[ -z "$TARGET" ]] && { echo "Usage: provision-db <target> [--dry-run]"; echo "Targets: $(list_targets | tr '\n' ' ')"; exit 1; }
+target_exists "$TARGET" || { echo "Unknown target: $TARGET"; echo "Valid: $(list_targets | tr '\n' ' ')"; exit 1; }
+
+# --- Resolve connection + provisioning config ---
+NAMESPACE="$(cfg "$TARGET" namespace)"
+SERVICE="$(cfg "$TARGET" service)"
+REMOTE_PORT="$(cfg "$TARGET" remote_port)"; REMOTE_PORT="${REMOTE_PORT:-5432}"
+LOCAL_PORT="$(cfg "$TARGET" local_port)";  LOCAL_PORT="${LOCAL_PORT:-55432}"
+DB_NAME="$(cfg "$TARGET" db_name)"
+DB_SCHEMA="$(cfg "$TARGET" schema)"; DB_SCHEMA="${DB_SCHEMA:-public}"
+
+ROLE_USER_DC="$(cfg "$TARGET" role_user_dc)"
+ROLE_PASS_DC="$(cfg "$TARGET" role_password_dc)"
+ROLE_USER="$(cfg "$TARGET" username)"
+
+ADMIN_SECRET="$(cfg "$TARGET" admin_secret)"; ADMIN_SECRET="${ADMIN_SECRET:-app-timescaledb-secrets}"
+ADMIN_USER_KEY="$(cfg "$TARGET" admin_user_key)"; ADMIN_USER_KEY="${ADMIN_USER_KEY:-POSTGRES_USER}"
+ADMIN_PASS_KEY="$(cfg "$TARGET" admin_password_key)"; ADMIN_PASS_KEY="${ADMIN_PASS_KEY:-POSTGRES_PASSWORD}"
+ADMIN_NS="$(cfg "$TARGET" admin_namespace)"; ADMIN_NS="${ADMIN_NS:-$NAMESPACE}"
+
+# role user: dc override, else target username
+[[ -n "$ROLE_USER_DC" ]] && ROLE_USER="$(dc_reveal "$ROLE_USER_DC")"
+[[ -z "$ROLE_PASS_DC" ]] && { echo "❌  target '$TARGET' missing 'role_password_dc' (dc address for the role password)." >&2; exit 1; }
+
+missing=()
+for v in NAMESPACE SERVICE DB_NAME ROLE_USER; do [[ -z "${!v}" ]] && missing+=("$v"); done
+[[ ${#missing[@]} -gt 0 ]] && { echo "❌  target '$TARGET' missing: ${missing[*]}" >&2; exit 1; }
+
+echo "── Provision DB [$TARGET] ──"
+echo "  instance : $SERVICE (ns=$NAMESPACE) :$REMOTE_PORT"
+echo "  database : $DB_NAME"
+echo "  role     : $ROLE_USER  (pw from dc: $ROLE_PASS_DC)"
+echo "  admin    : $ADMIN_USER_KEY @ $ADMIN_NS/$ADMIN_SECRET"
+
+# --- Fetch credentials ---
+ADMIN_USER="$(fetch_secret_value "$ADMIN_NS" "$ADMIN_SECRET" "$ADMIN_USER_KEY")" \
+  || { echo "❌  couldn't read $ADMIN_USER_KEY from $ADMIN_NS/$ADMIN_SECRET" >&2; exit 1; }
+ADMIN_PASS="$(fetch_secret_value "$ADMIN_NS" "$ADMIN_SECRET" "$ADMIN_PASS_KEY")" \
+  || { echo "❌  couldn't read $ADMIN_PASS_KEY from $ADMIN_NS/$ADMIN_SECRET" >&2; exit 1; }
+ROLE_PASS="$(dc_reveal "$ROLE_PASS_DC")"
+[[ -z "$ROLE_PASS" ]] && { echo "❌  role password empty from dc '$ROLE_PASS_DC'" >&2; exit 1; }
+
+if $DRY_RUN; then
+  echo ""
+  echo "🔍  DRY RUN — would (idempotently):"
+  echo "     CREATE DATABASE $DB_NAME (if absent)"
+  echo "     CREATE/ALTER ROLE $ROLE_USER WITH LOGIN PASSWORD '***' (from dc)"
+  echo "     GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $ROLE_USER"
+  echo "     GRANT ALL ON SCHEMA $DB_SCHEMA + default privileges TO $ROLE_USER"
+  exit 0
+fi
+
+# --- Port-forward ---
+echo ""
+echo "==> Port-forward $SERVICE:$REMOTE_PORT → localhost:$LOCAL_PORT"
+kubectl port-forward -n "$NAMESPACE" "$SERVICE" "$LOCAL_PORT:$REMOTE_PORT" &>/dev/null &
+PF_PID=$!
+for _ in {1..20}; do
+  nc -z localhost "$LOCAL_PORT" 2>/dev/null && break
+  kill -0 "$PF_PID" 2>/dev/null || { echo "❌  port-forward died (is $SERVICE in $NAMESPACE?)"; exit 1; }
+  sleep 0.5
+done
+nc -z localhost "$LOCAL_PORT" 2>/dev/null || { echo "❌  timed out waiting for port-forward"; exit 1; }
+
+# --- DDL (idempotent; mirrors initdb.d/_lib.sh create_db) ---
+export PGHOST=localhost PGPORT="$LOCAL_PORT" PGUSER="$ADMIN_USER" PGPASSWORD="$ADMIN_PASS"
+psql_admin() { psql -v ON_ERROR_STOP=1 -qtA "$@"; }
+
+pass_esc="${ROLE_PASS//\'/\'\'}"
+
+echo "==> Ensuring database '$DB_NAME'"
+if [[ "$(psql_admin -d postgres -c "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'")" != "1" ]]; then
+  psql_admin -d postgres -c "CREATE DATABASE \"$DB_NAME\""
+  echo "    created."
+else
+  echo "    exists."
+fi
+
+echo "==> Ensuring role '$ROLE_USER'"
+if [[ "$(psql_admin -d postgres -c "SELECT 1 FROM pg_roles WHERE rolname='$ROLE_USER'")" != "1" ]]; then
+  psql_admin -d postgres -c "CREATE ROLE \"$ROLE_USER\" WITH LOGIN PASSWORD '$pass_esc'"
+  echo "    created."
+else
+  psql_admin -d postgres -c "ALTER ROLE \"$ROLE_USER\" WITH LOGIN PASSWORD '$pass_esc'"
+  echo "    exists (password synced to dc)."
+fi
+
+echo "==> Granting privileges"
+psql_admin -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE \"$DB_NAME\" TO \"$ROLE_USER\""
+psql_admin -d "$DB_NAME" -c "
+  GRANT ALL ON SCHEMA $DB_SCHEMA TO \"$ROLE_USER\";
+  ALTER DEFAULT PRIVILEGES IN SCHEMA $DB_SCHEMA GRANT ALL ON TABLES TO \"$ROLE_USER\";
+  ALTER DEFAULT PRIVILEGES IN SCHEMA $DB_SCHEMA GRANT ALL ON SEQUENCES TO \"$ROLE_USER\";
+"
+
+echo ""
+echo "✅  Provisioned $DB_NAME / $ROLE_USER on $SERVICE ($NAMESPACE)."
+echo "    Next: liquibase-shell $TARGET -- update"
