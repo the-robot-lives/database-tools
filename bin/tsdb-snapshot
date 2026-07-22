@@ -244,14 +244,23 @@ ok "Snapshot: $SNAPSHOT_ID"
 
 # ── Wait for EBS snapshot to complete before releasing backup mode ──────────
 if [[ "$CONSISTENT" == "true" ]]; then
-  SNAPSHOT_TIMEOUT="${K8_TSDB_SNAPSHOT_TIMEOUT:-3600}"
-  step "Waiting for EBS snapshot to complete (timeout: ${SNAPSHOT_TIMEOUT}s)"
+  # 0 = no timeout (default): wait indefinitely for the snapshot to complete.
+  # Set K8_TSDB_SNAPSHOT_TIMEOUT=<seconds> to bound the wait. A large first-
+  # delta snapshot (weeks since the last one) can legitimately take hours; the
+  # non-exclusive pg_backup bracket held during the wait is harmless, and the
+  # EXIT/INT/TERM trap still guarantees release on any abort.
+  SNAPSHOT_TIMEOUT="${K8_TSDB_SNAPSHOT_TIMEOUT:-0}"
+  if [[ "$SNAPSHOT_TIMEOUT" -gt 0 ]]; then
+    step "Waiting for EBS snapshot to complete (timeout: ${SNAPSHOT_TIMEOUT}s)"
+  else
+    step "Waiting for EBS snapshot to complete (no timeout)"
+  fi
 
   _snap_start="$(date +%s)"
   _last_progress=""
   while true; do
     _elapsed="$(( $(date +%s) - _snap_start ))"
-    if [[ "$_elapsed" -ge "$SNAPSHOT_TIMEOUT" ]]; then
+    if [[ "$SNAPSHOT_TIMEOUT" -gt 0 && "$_elapsed" -ge "$SNAPSHOT_TIMEOUT" ]]; then
       warn "Snapshot wait timed out after ${SNAPSHOT_TIMEOUT}s — releasing backup mode anyway"
       _psql_session_exec "SELECT pg_backup_stop();" 2>/dev/null \
         || warn "pg_backup_stop failed — backup mode may need manual cleanup"
