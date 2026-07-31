@@ -16,7 +16,7 @@
 #     auto-generated instance password is NOT pinned in dc (drifts), so the live
 #     secret is the only reliable source for connecting as admin.
 #
-# Config: reuses the `liquibase_targets.<target>` block in .infra-config.yaml for
+# Config: reuses the `databases.<target> (fallback: liquibase_targets.<target>)` block in .infra-config.yaml for
 # connection details (namespace/service/ports/db_name/username), plus these
 # optional provisioning fields on the same target:
 #
@@ -108,10 +108,10 @@ find_config() {
 }
 CONFIG_FILE="$(find_config)"
 
-cfg() { yq -r "(.liquibase_targets.\"$1\".\"$2\" // \"\")" "$CONFIG_FILE"; }
-cfg_list() { yq -r "(.liquibase_targets.\"$1\".\"$2\" // [])[]?" "$CONFIG_FILE"; }
-list_targets() { yq -r '(.liquibase_targets // {}) | keys[]' "$CONFIG_FILE"; }
-target_exists() { [[ "$(yq -r "((.liquibase_targets // {}) | has(\"$1\"))" "$CONFIG_FILE")" == "true" ]]; }
+cfg() { yq -r "((.databases // .liquibase_targets).\"$1\".\"$2\" // \"\")" "$CONFIG_FILE"; }
+cfg_list() { yq -r "((.databases // .liquibase_targets).\"$1\".\"$2\" // [])[]?" "$CONFIG_FILE"; }
+list_targets() { yq -r '((.databases // .liquibase_targets) // {}) | keys[]' "$CONFIG_FILE"; }
+target_exists() { [[ "$(yq -r "((( .databases // .liquibase_targets) // {}) | has(\"$1\"))" "$CONFIG_FILE")" == "true" ]]; }
 
 fetch_secret_value() {
   local ns="$1" name="$2" key="$3" enc
