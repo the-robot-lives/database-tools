@@ -114,25 +114,39 @@ resolve_config_path() {
   fi
 }
 
+# Config key for targets: prefer liquibase_targets (docs/legacy), fall back to
+# databases (Noizu monorepo .infra-config.yaml uses this section name).
+targets_root() {
+  # Returns the yq path expression for the targets map (no leading dot needed
+  # beyond the expression we embed). Prefer liquibase_targets when non-empty.
+  if [[ "$(yq -r '(.liquibase_targets // {}) | length' "$CONFIG_FILE" 2>/dev/null)" != "0" ]]; then
+    echo "liquibase_targets"
+  else
+    echo "databases"
+  fi
+}
+
+TARGETS_KEY="$(targets_root)"
+
 # --- Helper: read a target field from config ---
 cfg() {
   local target="$1" field="$2"
-  yq -r "(.liquibase_targets.\"$target\".\"$field\" // \"\")" "$CONFIG_FILE"
+  yq -r "(.$TARGETS_KEY.\"$target\".\"$field\" // \"\")" "$CONFIG_FILE"
 }
 
 cfg_list() {
   local target="$1" field="$2"
-  yq -r "(.liquibase_targets.\"$target\".\"$field\" // [])[]?" "$CONFIG_FILE"
+  yq -r "(.$TARGETS_KEY.\"$target\".\"$field\" // [])[]?" "$CONFIG_FILE"
 }
 
 # --- List available targets ---
 list_targets() {
-  yq -r '(.liquibase_targets // {}) | keys[]' "$CONFIG_FILE"
+  yq -r "(.$TARGETS_KEY // {}) | keys[]" "$CONFIG_FILE"
 }
 
 target_exists() {
   local target="$1"
-  [[ "$(yq -r "((.liquibase_targets // {}) | has(\"$target\"))" "$CONFIG_FILE")" == "true" ]]
+  [[ "$(yq -r "((.$TARGETS_KEY // {}) | has(\"$target\"))" "$CONFIG_FILE")" == "true" ]]
 }
 
 fetch_secret_value() {
@@ -158,17 +172,43 @@ fetch_secret_value_from_keys() {
   return 1
 }
 
-# --- Target selection ---
-TARGET="${1:-}"
-if [[ -n "$TARGET" && "$TARGET" != "--" ]]; then
+# --- Global flags + target selection ---
+# --yes / LIQUIBASE_ASSUME_YES=1 skips destructive confirm prompts (agents/CI).
+# Accepts: liquibase-shell [--yes] <target> [--yes] -- <cmd...>
+ASSUME_YES=false
+[[ "${LIQUIBASE_ASSUME_YES:-}" =~ ^(1|true|yes)$ ]] && ASSUME_YES=true
+
+TARGET=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --yes)
+      ASSUME_YES=true
+      shift
+      ;;
+    --shell | --)
+      break
+      ;;
+    -*)
+      # unknown global flag — leave for later / error
+      break
+      ;;
+    *)
+      TARGET="$1"
+      shift
+      break
+      ;;
+  esac
+done
+# optional second --yes after target
+if [[ "${1:-}" == "--yes" ]]; then
+  ASSUME_YES=true
   shift
-else
-  TARGET=""
 fi
 
 if [[ -z "$TARGET" ]]; then
   if [[ -z "$(list_targets)" ]]; then
-    echo "No liquibase_targets configured in $CONFIG_FILE"
+    echo "No liquibase targets configured in $CONFIG_FILE"
+    echo "Expected section: liquibase_targets or databases"
     exit 1
   fi
 
@@ -299,8 +339,12 @@ check_safety() {
       update|rollback|rollback-count|drop-all|clear-checksums)
         echo ""
         echo "⚠  You are about to run '$cmd' against $TARGET (DESTRUCTIVE)."
-        read -rp "Type 'yes' to confirm: " CONFIRM
-        [[ "$CONFIRM" != "yes" ]] && { echo "Aborted."; return 1; }
+        if [[ "$ASSUME_YES" == true ]]; then
+          echo "  (confirmed via --yes / LIQUIBASE_ASSUME_YES)"
+        else
+          read -rp "Type 'yes' to confirm: " CONFIRM
+          [[ "$CONFIRM" != "yes" ]] && { echo "Aborted."; return 1; }
+        fi
         ;;
     esac
   fi
@@ -451,8 +495,48 @@ echo "==> Connected: $DB_TYPE @ localhost:$LOCAL_PORT/$DB_NAME (user: $DB_USER)"
 echo ""
 
 # --- Run liquibase ---
+# Prefer local `liquibase` on PATH; fall back to Docker image (same version as
+# app backend db Dockerfiles) when the CLI is not installed.
+LIQUIBASE_DOCKER_IMAGE="${LIQUIBASE_DOCKER_IMAGE:-liquibase/liquibase:4.29}"
 run_lb() {
-  liquibase --defaults-file="$TMPDIR_LB/liquibase.properties" "$@"
+  if command -v liquibase >/dev/null 2>&1; then
+    liquibase --defaults-file="$TMPDIR_LB/liquibase.properties" "$@"
+    return
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "ERROR: neither 'liquibase' nor 'docker' is on PATH." >&2
+    echo "Install liquibase (brew install liquibase) or start Docker Desktop." >&2
+    return 127
+  fi
+  # Mount changelog tree + properties. Use host.docker.internal for JDBC on macOS
+  # Docker Desktop (host network is unreliable there).
+  local jdbc_host="host.docker.internal"
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    jdbc_host="172.17.0.1"
+  fi
+  # Rewrite localhost → docker-reachable host in a temp properties copy
+  local docker_props="$TMPDIR_LB/liquibase.docker.properties"
+  sed "s|localhost:$LOCAL_PORT|$jdbc_host:$LOCAL_PORT|g" \
+    "$TMPDIR_LB/liquibase.properties" >"$docker_props"
+
+  local mounts=(-v "$TMPDIR_LB:/lb:ro")
+  local search_paths=()
+  if [[ -n "${CHANGELOG_SEARCH_PATH:-}" && -d "$CHANGELOG_SEARCH_PATH" ]]; then
+    mounts+=(-v "$CHANGELOG_SEARCH_PATH:$CHANGELOG_SEARCH_PATH:ro")
+  fi
+  # Also mount CONFIG_ROOT so absolute paths under the monorepo resolve
+  if [[ -n "${CONFIG_ROOT:-}" && -d "$CONFIG_ROOT" ]]; then
+    mounts+=(-v "$CONFIG_ROOT:$CONFIG_ROOT:ro")
+  fi
+
+  echo "  (using docker $LIQUIBASE_DOCKER_IMAGE — install local liquibase to skip)"
+  docker run --rm \
+    --add-host=host.docker.internal:host-gateway \
+    "${mounts[@]}" \
+    -w /lb \
+    "$LIQUIBASE_DOCKER_IMAGE" \
+    --defaults-file=/lb/liquibase.docker.properties \
+    "$@"
 }
 
 interactive_shell() {

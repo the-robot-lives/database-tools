@@ -11,16 +11,29 @@ make install    # Installs liquibase-shell, liquibase-update, tsdb-snapshot
 ## Prerequisites
 
 - `kubectl` with cluster access
-- `liquibase` for `liquibase-shell`
+- `liquibase` **or** Docker Desktop (CLI preferred; docker `liquibase/liquibase:4.29` is the fallback)
 - `yq` for config parsing
 - `nc` for port-forward readiness checks
 - `psql` or `mysql` for direct database operations inside `--shell` mode (optional)
 
+### Non-interactive / agent use
+
+```bash
+# skip destructive confirm prompts
+liquibase-shell --yes therobotplans -- status
+LIQUIBASE_ASSUME_YES=1 liquibase-shell therobotplans -- update
+```
+
 ## Configuration
 
-`liquibase-shell` reads `liquibase_targets` from the resolved `infra-config.yaml`
-or `.infra-config.yaml`. Set `LIQUIBASE_CONFIG=/path/to/config.yaml` to override
+`liquibase-shell` reads targets from the resolved `infra-config.yaml` or
+`.infra-config.yaml`. Set `LIQUIBASE_CONFIG=/path/to/config.yaml` to override
 the default search.
+
+Target section (first non-empty wins):
+
+1. `liquibase_targets` — documented / legacy name  
+2. `databases` — Noizu monorepo name (`.infra-config.yaml`)
 
 Targets define the Kubernetes service to port-forward, the secret keys to read,
 and optionally the Liquibase changelog path. Instance-level targets may omit a
@@ -28,7 +41,8 @@ changelog and are treated as connection shells unless a `--changelog-file`
 argument is supplied. Example:
 
 ```yaml
-liquibase_targets:
+# either key works:
+liquibase_targets:   # or: databases:
   start-app:
     namespace: data-ns
     service: svc/shared-postgres
