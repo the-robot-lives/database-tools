@@ -2,126 +2,151 @@
 
 ## Overview
 
-**database-utils** is a terminal utility package: CLI tools and SQL templates for
-administering K8s-hosted PostgreSQL/TimescaleDB (and Valkey/Redis) instances in the
-Noizu infrastructure. It covers four concerns: interactive/one-shot Liquibase
-migrations through kubectl port-forwards (`liquibase-shell`), a legacy one-shot
-Liquibase K8s Job (`liquibase-update`), on-demand database/role/ACL-user
-provisioning on running instances (`provision-db`), and app-consistent EBS
-snapshots of TimescaleDB volumes (`tsdb-snapshot`).
+**database-utils** is a Bash/SQL utility package for operating K8s-hosted
+PostgreSQL/TimescaleDB (and optional Valkey/Redis) in the Noizu monorepo. Four
+CLIs cover day-to-day DB ops:
 
-All tools are config-driven off the repo's `infra-config.yaml` /
-`.infra-config.yaml` (the monorepo's single source of build/deploy metadata):
-`liquibase-shell` and `provision-db` read `liquibase_targets`, `tsdb-snapshot`
-reads `tsdb_snapshot_targets`. Tools install to `~/.local/bin` via `make install`
-(part of the wider `make install-utilities` flow) and source the shared `k8-lib`
-(`~/.local/share/k8-lib`) for common helpers and `--assist` AI help.
+| Concern | Tool |
+|---------|------|
+| Interactive / one-shot Liquibase via local port-forward | `liquibase-shell` |
+| Legacy one-shot in-cluster Liquibase Job (gnp-backend only) | `liquibase-update` |
+| Create DB + login role (+ optional Valkey ACL) on a *live* instance | `provision-db` |
+| App-consistent EBS snapshot of a TimescaleDB volume | `tsdb-snapshot` |
+
+Plus hand-run SQL templates for PgBouncer auth and migrate roles.
+
+Config lives outside this package in monorepo `infra-config.yaml` /
+`.infra-config.yaml`: Liquibase/provision tools read `liquibase_targets` and/or
+`databases`; snapshots read `tsdb_snapshot_targets`. Install:
+`make install` → `~/.local/bin` (also via repo-root `make install-utilities`).
+Dual path: `Portfolio/Utilities/source/database-utils` ↔
+`utilities/database/database-utils`.
 
 ## System Diagram
 
 ```mermaid
 graph TB
-    subgraph "database-utils CLI"
-        LS[bin/liquibase-shell]
-        LU[bin/liquibase-update]
-        PD[bin/provision-db]
-        TS[bin/tsdb-snapshot]
+    subgraph "database-utils"
+        LS[liquibase-shell]
+        LU[liquibase-update]
+        PD[provision-db]
+        TS[tsdb-snapshot]
+        SQL[SQL templates]
     end
 
-    CFG[infra-config.yaml<br/>liquibase_targets / tsdb_snapshot_targets] --> LS
+    CFG["infra-config.yaml<br/>liquibase_targets / databases<br/>tsdb_snapshot_targets"]
+    CFG --> LS
     CFG --> PD
     CFG --> TS
 
-    LS -->|kubectl port-forward + secret read| PG[(Postgres / TimescaleDB svc)]
-    LS -->|local liquibase CLI| PG
-    LU -->|kubectl apply: one-shot Job + ConfigMap| JOB[Liquibase Job in-cluster]
+    LS -->|port-forward + secret read| PG[(Postgres / TimescaleDB)]
+    LS -->|local liquibase or Docker image| PG
+    LU -->|Job + ConfigMap| JOB[In-cluster Liquibase Job]
     JOB --> PG
-    PD -->|psql via port-forward, admin secret| PG
+    PD -->|psql via port-forward| PG
     PD -->|redis-cli ACL SETUSER| VK[(Valkey)]
-    PD -->|role/ACL creds| DC[dc / direnv-config]
-    TS -->|kubectl exec psql: pg_backup_start/stop| PG
+    PD -->|role/ACL passwords| DC[dc / direnv-config]
+    PD -->|admin passwords| KSEC[K8s Secrets]
+    TS -->|kubectl exec: pg_backup_start/stop| PG
     TS -->|aws ec2 create-snapshot| EBS[(EBS Volume)]
+    SQL -.->|operator copies & runs| PG
 
-    LIB[k8-lib: common.sh + assist.sh] -.-> LS & LU & PD & TS
+    ASSIST[k8-lib assist.sh] -.-> LU & PD & TS
+    COMMON[k8-lib common.sh] -.-> TS
 ```
 
 ## Core Components
 
 | Component | Purpose |
 |-----------|---------|
-| `bin/liquibase-shell` | Interactive/one-shot Liquibase against K8s DBs: port-forward, secret-sourced creds, menu / `-- <cmd>` / `--shell` env-export modes |
-| `bin/liquibase-update` | Legacy one-shot in-cluster Liquibase update Job for the gnp-backend schema (hardcoded target; no Helm hook needed) |
-| `bin/provision-db` | Create Postgres DB + login role (and optional Valkey ACL user) on a *running* instance — covers apps added after initdb ran |
-| `bin/tsdb-snapshot` | App-consistent EBS snapshot of a TimescaleDB volume, bracketed by `pg_backup_start/stop`; `--crash-only` skips the bracket |
-| `bin/pgbouncer-auth-setup.sql` | Template: PgBouncer auth user with `SECURITY DEFINER` credential lookup + read-only app user |
-| `bin/sql/create-migrate-user.sql` | Template: migration role with DDL privileges scoped to app/public schemas |
-| `Makefile` | `make install` → symlinks liquibase-shell/liquibase-update/provision-db, copies tsdb-snapshot to `~/.local/bin` |
+| `bin/liquibase-shell` | Port-forward + secret-sourced creds; interactive menu, `target -- <cmd>`, or `--shell` env export. Prefer local `liquibase`; Docker `liquibase/liquibase:4.29` fallback. Safety modes + `--yes` / `LIQUIBASE_ASSUME_YES` |
+| `bin/liquibase-update` | Hardcoded gnp-backend Job (`namespace=gnp`, image tag overridable via `LIQUIBASE_TAG`); `--dry-run` → `update-sql`. No infra-config |
+| `bin/provision-db` | Idempotent `CREATE DATABASE` / role + grants (+ optional extensions); optional Valkey `ACL SETUSER` when `redis_password_dc` set. Flags: `--dry-run`, `--redis-only`, `--skip-redis` / `--db-only`, `--list` |
+| `bin/tsdb-snapshot` | Primary check → session-scoped `pg_backup_start` → EBS snapshot (wait complete) → `pg_backup_stop`. `--crash-only` or target `crash_only: true` for standbys |
+| `bin/pgbouncer-auth-setup.sql` | Template: PgBouncer `auth_user` + `SECURITY DEFINER` `pgbouncer.get_auth()` + read-only app user |
+| `bin/sql/create-migrate-user.sql` | Template: migrate role with schema/public DML + DDL + `GRANT postgres` for ownership |
+| `Makefile` | `install`: symlink shell tools, *copy* `tsdb-snapshot`; SQL not installed. `compile`/`test` no-ops |
 
 ## liquibase-shell
 
-Resolves config (`$LIQUIBASE_CONFIG` → cwd → repo-root, `infra-config.yaml` then
-`.infra-config.yaml`), port-forwards the target service, fetches credentials from
-K8s secrets (with key fallbacks), and runs local `liquibase` against the forward.
-`--shell` exports `LB_DEFAULTS_FILE`, `PG*` vars, `LB_CHANGELOG_PATH/DIR` while
-keeping the forward alive; instance-level targets without a changelog act as
-connection shells. Defaults `KUBECONFIG` to `~/.kube/noizu/config`.
+Resolves config first-match: `$LIQUIBASE_CONFIG` → cwd / git-root
+`infra-config.yaml` / `.infra-config.yaml` → walk-up. Target map: non-empty
+`liquibase_targets`, else `databases`. Required target fields: namespace, service,
+ports, `db_type`, secret name/key; `db_name` or `db_name_key`; `username` or
+`username_key`. Secret/username/db-name keys support fallbacks lists. Optional
+changelog → instance-level connection shell unless `--changelog-file` supplied.
 
-→ *See [liquibase-shell-spec.md](liquibase-shell-spec.md) for the full spec*
+Defaults `KUBECONFIG` to `~/.kube/noizu/config` when unset. EXIT/INT/TERM trap
+kills port-forward and temp liquibase.properties dir.
+
+**Safety:** `safety: readonly` blocks non-whitelist cmds; `destructive` confirms
+`update` / rollback / `drop-all` / `clear-checksums` unless `--yes`.
+
+→ Full behavior: [liquibase-shell-spec.md](liquibase-shell-spec.md)
 
 ## provision-db
 
-Solves the "running instance never re-runs initdb.d" gap: apps (or Valkey ACL
-users) added after first init get their database/role/ACL created on demand.
-Credential model mirrors the cluster: role/ACL passwords come from `dc`
-(direnv-config, the declarative source that syncs to K8s secrets via Infisical);
-superuser/default-user passwords come from the live K8s admin secret (not pinned
-in dc). Reuses `liquibase_targets.<target>` plus optional provisioning fields
-(`role_password_dc`, `admin_secret`, `redis_*`). Note: live `ACL SETUSER` on
-app-valkey is lost on pod restart — durable fix is the chart's `--user` args.
+Closes the “initdb.d only runs on first empty data dir” gap: apps added later
+get DB/role (and optional Valkey ACL) on demand. Reuses the same target block as
+Liquibase (`databases` preferred via yq `//`, else `liquibase_targets`) plus
+provisioning fields (`role_password_dc`, optional `role_user_dc`, `admin_*`,
+`extensions`, `redis_*`).
+
+**Credentials:** role/ACL passwords from `dc` (same values Infisical syncs to
+app secrets); superuser / Valkey default-user from live K8s admin secrets (not
+pinned in dc). Live `ACL SETUSER` is lost on Valkey pod restart — durable path
+is chart/`acl_users` in TF.
+
+Also defaults `KUBECONFIG` to noizu config; dual port-forward cleanup trap.
 
 ## tsdb-snapshot
 
-Named targets under `tsdb_snapshot_targets` (resolved via k8-lib's merged-config
-walker). Consistent mode verifies the pod is a primary, runs `pg_backup_start`
-(fast=false, waits for a spread checkpoint — generous inline wait, default 900s),
-snapshots the EBS volume behind the PVC via `aws ec2 create-snapshot`, then
-`pg_backup_stop`. An exit/signal trap always releases backup mode; the
-non-exclusive backup also auto-aborts if the psql session drops. Standby volumes:
-`--crash-only` (or `crash_only: true` on the target).
+Named targets under `tsdb_snapshot_targets` via k8-lib merged-config walker
+(`--config` is a **target name**, not a file path). Requires `k8-lib`
+(`common.sh` + `assist.sh`) at `~/.local/share/k8-lib`.
+
+Consistent path: verify `pg_is_in_recovery=f`, keep one `kubectl exec` psql
+session (FIFO) for session-scoped non-exclusive backup, `pg_backup_start`
+(`fast=false`, wait up to `K8_TSDB_PSQL_WAIT_SECS` default 900s), resolve
+PVC→PV→EBS `volumeHandle`, `aws ec2 create-snapshot` + tags, wait until
+snapshot `completed` (optional `K8_TSDB_SNAPSHOT_TIMEOUT`), then
+`pg_backup_stop`. EXIT/INT/TERM always releases backup mode; dropped session
+auto-aborts non-exclusive backup.
 
 ## Key Design Decisions
 
-- **Config-driven targets, not flags**: connection topology lives in
-  `.infra-config.yaml` (monorepo convention) so new targets need no script edits
-  and teams can carry per-project overrides.
-- **Port-forward + local tooling** (`liquibase-shell`, `provision-db`) vs
-  **in-cluster Job** (`liquibase-update`): the shell tools favor operator
-  interactivity; the Job variant is the legacy path kept for the gnp target.
-- **App-consistent snapshots by default**: crash-only is opt-in, since restoring
-  an unbracketed snapshot of a busy primary risks longer recovery.
-- **Split credential sourcing** (`provision-db`): declared creds from dc,
-  drifting instance-admin creds from the live K8s secret.
-- **Template-based SQL**: `${VARIABLE}` placeholders, operator reviews and
-  customizes before running on the primary; `make install` never deploys them.
-- **Safety rails**: `KUBECONFIG` defaults to the noizu cluster; cleanup traps
-  kill port-forwards and release Postgres backup mode on any exit.
+- **Config-driven topology**: new DB targets are YAML, not script edits;
+  per-project overrides via `$LIQUIBASE_CONFIG` / search order.
+- **Local tooling vs in-cluster Job**: shell/provision use port-forward for
+  operator interactivity; `liquibase-update` is a narrow legacy gnp path.
+- **Split credential model** (`provision-db`): declared app secrets via `dc`;
+  drifting instance-admin secrets from the live cluster.
+- **App-consistent snapshots by default**: crash-only is opt-in (standbys /
+  recovery volumes cannot run `pg_backup_start`).
+- **SQL as templates only**: `${VAR}` placeholders; never installed; run on
+  primary after operator review.
+- **Safety rails**: noizu `KUBECONFIG` default on shell tools; Liquibase safety
+  gates; cleanup traps for port-forwards and backup mode.
 
 ## Dependencies
 
-| Dependency | Purpose |
+| Dependency | Used by |
 |------------|---------|
-| `k8-lib` (`common.sh`, `assist.sh`) | Shared shell helpers (`step`/`ok`/`die`), merged-config resolution, `--assist` AI help |
-| `kubectl` | Port-forwards, secret reads, `exec`, Job creation |
-| `liquibase` | Local CLI for `liquibase-shell` |
-| `yq` (v4+) | YAML config parsing |
-| `aws` CLI | EBS snapshot creation/tagging (`tsdb-snapshot`) |
-| `dc` (direnv-config) | Declarative credential source (`provision-db`) |
-| `psql` / `redis-cli` / `nc` | DB ops, ACL setup, port-forward readiness checks |
+| `kubectl` | all CLIs |
+| `yq` (v4+) | config parsing (shell, provision, snapshot) |
+| `liquibase` or Docker | `liquibase-shell` |
+| `psql` | `provision-db`; optional in `--shell`; snapshot via `kubectl exec` |
+| `redis-cli` | `provision-db` Valkey path |
+| `nc` | port-forward readiness |
+| `dc` (direnv-config) | `provision-db` role/ACL passwords |
+| `aws` CLI | `tsdb-snapshot` |
+| `k8-lib` assist | `liquibase-update`, `provision-db`, `tsdb-snapshot` (`--assist`) |
+| `k8-lib` common | `tsdb-snapshot` only (merged config, `step`/`ok`/`die`) |
 
 ## Ecosystem Fit
 
-Lives at `utilities/database/database-utils` in the Noizu Infra monorepo; installed
-alongside the other DevOps utilities by the repo-root `make install-utilities`.
-Consumes the same `.infra-config.yaml` conventions as `docker-build`,
-`helm-upgrade`, and `deploy-service`, and the same secrets flow
-(dc → Infisical → K8s Secrets) documented in the repo root.
+Part of Noizu Infra DevOps utilities (install with other `utilities/*` tools).
+Shares monorepo `.infra-config.yaml` conventions with `docker-build` /
+`helm-upgrade` / `deploy-service`, and the secrets flow **dc → Infisical → K8s
+Secrets**. Liquibase targets map to changelogs under portfolio apps; snapshot
+targets map to TimescaleDB PVCs on AWS EBS.

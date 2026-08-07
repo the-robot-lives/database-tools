@@ -1,36 +1,38 @@
 # Project Architecture Summary
 
-Terminal utility package: CLI tools + SQL templates for administering K8s-hosted
-PostgreSQL/TimescaleDB and Valkey in the Noizu infrastructure. Config-driven off
-`infra-config.yaml` / `.infra-config.yaml` (`liquibase_targets`,
-`tsdb_snapshot_targets`); installs to `~/.local/bin` via `make install`; sources
-shared `k8-lib` for helpers and `--assist`.
+Bash/SQL package for K8s PostgreSQL/TimescaleDB (+ Valkey) ops in Noizu Infra.
+Config outside package: `liquibase_targets` / `databases` and
+`tsdb_snapshot_targets` in monorepo `infra-config.yaml` / `.infra-config.yaml`.
+Install: `make install` → `~/.local/bin`. Dual path:
+`Portfolio/Utilities/source/database-utils` ↔ `utilities/database/database-utils`.
 
 ## Components
 
-- **bin/liquibase-shell** — interactive/one-shot Liquibase via kubectl port-forward; K8s-secret creds; `--shell` exports PG*/LB_* env
-- **bin/liquibase-update** — legacy one-shot in-cluster Liquibase Job (hardcoded gnp-backend target)
-- **bin/provision-db** — create Postgres DB/role + optional Valkey ACL user on a running instance (post-initdb apps)
-- **bin/tsdb-snapshot** — app-consistent EBS snapshot bracketed by pg_backup_start/stop; `--crash-only` for standbys
-- **bin/pgbouncer-auth-setup.sql** — template: PgBouncer auth user (SECURITY DEFINER) + read-only user
-- **bin/sql/create-migrate-user.sql** — template: migration role with scoped DDL privileges
-- **Makefile** — symlinks the three shell tools, copies tsdb-snapshot
+- **liquibase-shell** — port-forward + K8s-secret creds; menu / `-- <cmd>` /
+  `--shell`; local liquibase or Docker 4.29; `safety` + `--yes`; prefers
+  `liquibase_targets` then `databases`
+- **liquibase-update** — hardcoded gnp-backend one-shot Job; no infra-config
+- **provision-db** — live CREATE DB/role (+ extensions); optional Valkey ACL;
+  role/ACL pw from `dc`, admin from K8s secret; `databases` // `liquibase_targets`
+- **tsdb-snapshot** — app-consistent EBS snap (`pg_backup_start/stop` session);
+  `--crash-only` for standbys; needs k8-lib common + assist
+- **pgbouncer-auth-setup.sql** / **sql/create-migrate-user.sql** — manual templates
+- **Makefile** — symlink three shells, copy tsdb-snapshot; SQL not installed
 
 ## Design Principles
 
-- Config-driven targets in .infra-config.yaml, not script flags
-- Port-forward + local tooling for interactivity; in-cluster Job only for legacy path
-- App-consistent snapshots by default; crash-only opt-in
-- Split credential sourcing: role/ACL creds from dc, live admin creds from K8s secret
-- Template-based SQL with manual review before execution
-- Cleanup traps release port-forwards and Postgres backup mode on any exit
+- Topology in YAML, not flags; operator interactivity via port-forward
+- Split creds: dc for app secrets, live K8s for instance admin
+- Consistent snapshots default; crash-only opt-in
+- Cleanup traps for port-forwards and Postgres backup mode
+- SQL templates reviewed/customized before primary execution
 
 ## Dependencies
 
-k8-lib (common.sh/assist.sh), kubectl, liquibase, yq v4+, aws CLI, dc, psql, redis-cli, nc
+kubectl, yq v4+, liquibase|Docker, psql, redis-cli, nc, dc, aws CLI;
+k8-lib assist (update/provision/snapshot); k8-lib common (snapshot only)
 
 ## Ecosystem Fit
 
-Part of the Noizu Infra monorepo utilities; installed by repo-root
-`make install-utilities`; shares `.infra-config.yaml` conventions and the
-dc → Infisical → K8s Secrets flow with the other DevOps tools.
+Monorepo utilities; `make install-utilities`; same `.infra-config.yaml` +
+dc → Infisical → K8s Secrets flow as other DevOps tools.
