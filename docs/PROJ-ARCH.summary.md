@@ -3,6 +3,7 @@
 Bash/SQL package for K8s PostgreSQL/TimescaleDB (+ Valkey) ops in Noizu Infra.
 Config outside package: `liquibase_targets` / `databases` and
 `tsdb_snapshot_targets` in monorepo `infra-config.yaml` / `.infra-config.yaml`.
+Field reference: [PROJ-SCHEMA.md](PROJ-SCHEMA.md) (no own persistence layer).
 Install: `make install` → `~/.local/bin`. Dual path:
 `Portfolio/Utilities/source/database-utils` ↔ `utilities/database/database-utils`.
 
