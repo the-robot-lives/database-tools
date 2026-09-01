@@ -6,7 +6,8 @@ Installs to `~/.local/bin` via `make install` (or monorepo `make install-utiliti
 Dual-path: `Portfolio/Utilities/source/database-utils` ↔ `utilities/database/database-utils`.
 
 Plain tree: [PROJ-LAYOUT.summary.md](PROJ-LAYOUT.summary.md).
-Arch: [PROJ-ARCH.md](PROJ-ARCH.md). How-to: [PROJ-HOWTO.md](PROJ-HOWTO.md).
+Arch: [PROJ-ARCH.md](PROJ-ARCH.md). Schema/config artifacts:
+[PROJ-SCHEMA.md](PROJ-SCHEMA.md). How-to: [PROJ-HOWTO.md](PROJ-HOWTO.md).
 
 ```
 database-utils/
@@ -27,6 +28,7 @@ database-utils/
 │   └── howto/
 │       └── provision-db.md         #   Full provision-db walkthrough (fields, dc, verify)
 ├── CHANGELOG.md                    # Package changelog / milestones
+├── merge-notes.md                  # sep-1 branch-sweep notes (transient; delete after merge plan completes)
 ├── .gitignore                      # .DS_Store, editor swap, .env, .envrc.local
 ├── Makefile                        # compile/test no-ops; install → ~/.local/bin
 └── README.md                       # Start here — install, prereqs, config, usage
