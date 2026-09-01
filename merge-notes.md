@@ -22,3 +22,4 @@ Pruned merged branches: 0.
 
 ## Open PRs
 none
+- Dual checkout: made in this checkout (/Users/keithbrings/Work/Space/Noizu/Portfolio/Utilities/source/database-utils); twin checkout `utilities/k8/cluster-utils` shares the remote and was NOT touched.
