@@ -4,3 +4,6 @@
 *~
 .env
 .envrc.local
+
+# Canonical worktree placement
+.claude/worktrees/
