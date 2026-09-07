@@ -17,7 +17,8 @@ Plus hand-run SQL templates for PgBouncer auth and migrate roles.
 
 Config lives outside this package in monorepo `infra-config.yaml` /
 `.infra-config.yaml`: Liquibase/provision tools read `liquibase_targets` and/or
-`databases`; snapshots read `tsdb_snapshot_targets`. Install:
+`databases`; snapshots read `tsdb_snapshot_targets`. Field-level config
+reference: [PROJ-SCHEMA.md](PROJ-SCHEMA.md). Install:
 `make install` → `~/.local/bin` (also via repo-root `make install-utilities`).
 Dual path: `Portfolio/Utilities/source/database-utils` ↔
 `utilities/database/database-utils`.

@@ -21,6 +21,7 @@ database-utils/
 │   ├── liquibase-shell-spec.md
 │   └── howto/provision-db.md
 ├── CHANGELOG.md
+├── merge-notes.md                  # sep-1 branch-sweep notes (transient)
 ├── .gitignore
 ├── Makefile                        # make install → ~/.local/bin
 └── README.md
