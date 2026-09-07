@@ -1,48 +1,61 @@
-# database-tools — Database Utilities
+# database-tools
 
-TimescaleDB snapshot, Liquibase migration, and database administration tools.
+**Repo:** https://github.com/the-robot-lives/database-tools
 
-## Installation
+Liquibase migration shells, database provisioning, and TimescaleDB snapshot helpers for the Noizu Kubernetes fleet.
 
-```bash
-make install    # Installs liquibase-shell, liquibase-update, tsdb-snapshot
-```
+## What
 
-## Prerequisites
+Bash CLIs that wrap Liquibase and direct database administration against databases running in the cluster — reached through kubectl port-forwards with credentials pulled from Kubernetes Secrets. "Liquibase owns the schema" is a monorepo-wide rule; these tools are how agents and humans run it.
+
+## Why
+
+Every portfolio app's schema migrations go through Liquibase, but Liquibase itself is awkward to drive against a cluster-hosted Postgres/MySQL: you need a port-forward, the right secret keys, the right changelog path, and a container or local install. These tools encode that wiring per target in `infra-config.yaml` so a migration is one command (`liquibase-shell <target> -- update`) instead of a checklist. `provision-db` and the SQL templates cover the surrounding admin work (migration users, PgBouncer auth).
+
+## Getting Started
+
+Prerequisites:
 
 - `kubectl` with cluster access
-- `liquibase` **or** Docker Desktop (CLI preferred; docker `liquibase/liquibase:4.29` is the fallback)
-- `yq` for config parsing
-- `nc` for port-forward readiness checks
-- `psql` or `mysql` for direct database operations inside `--shell` mode (optional)
-
-### Non-interactive / agent use
+- `liquibase` CLI, or Docker Desktop (the `liquibase/liquibase:4.29` image is the fallback)
+- `yq` for config parsing; `nc` for port-forward readiness checks
+- `psql` / `mysql` for `--shell` direct-DB mode (optional)
 
 ```bash
-# skip destructive confirm prompts
-liquibase-shell --yes therobotplans -- status
+make install    # liquibase-shell, liquibase-update, provision-db (symlinked),
+                # tsdb-snapshot -> ~/.local/bin
+make test       # placeholder (no-op)
+```
+
+Also installed by the monorepo root `make install-utilities`. Migrations land via this tooling in repos/changelogs — deployment itself is CI/CD-driven; run `liquibase-shell` after changelog changes merge.
+
+## Usage
+
+```bash
+liquibase-shell                          # prompt for a target
+liquibase-shell start-app                # interactive Liquibase menu
+liquibase-shell start-app -- status      # pass through Liquibase commands
+liquibase-shell start-app -- update-sql
+liquibase-shell start-app --shell        # connection shell (env vars exported)
+liquibase-shell shared-postgres -- --changelog-file=/path/to/changelog.yaml status
+
+liquibase-update                         # legacy one-shot Liquibase update Job
+tsdb-snapshot                            # create/manage TimescaleDB snapshots
+```
+
+Non-interactive / agent use:
+
+```bash
+liquibase-shell --yes therobotplans -- status          # skip destructive confirms
 LIQUIBASE_ASSUME_YES=1 liquibase-shell therobotplans -- update
 ```
 
 ## Configuration
 
-`liquibase-shell` reads targets from the resolved `infra-config.yaml` or
-`.infra-config.yaml`. Set `LIQUIBASE_CONFIG=/path/to/config.yaml` to override
-the default search.
-
-Target section (first non-empty wins):
-
-1. `liquibase_targets` — documented / legacy name  
-2. `databases` — Noizu monorepo name (`.infra-config.yaml`)
-
-Targets define the Kubernetes service to port-forward, the secret keys to read,
-and optionally the Liquibase changelog path. Instance-level targets may omit a
-changelog and are treated as connection shells unless a `--changelog-file`
-argument is supplied. Example:
+Targets come from the resolved `infra-config.yaml` / `.infra-config.yaml` (override with `LIQUIBASE_CONFIG`). First non-empty of `liquibase_targets` / `databases` wins. A target names the k8s service to port-forward, the secret keys for credentials, and optionally the changelog:
 
 ```yaml
-# either key works:
-liquibase_targets:   # or: databases:
+liquibase_targets:
   start-app:
     namespace: data-ns
     service: svc/shared-postgres
@@ -53,46 +66,20 @@ liquibase_targets:   # or: databases:
     schema: public
     secret_name: data-postgres-secrets
     username_key: STARTAPP_DB_USER
-    username_key_fallbacks:
-      - START_APP_DB_USER
     secret_key: STARTAPP_DB_PASSWORD
-    secret_key_fallbacks:
-      - START_APP_DB_PASSWORD
     safety: destructive
     changelog_dir: incubator/start-app/backend/db
     changelog_file: changelog/db.changelog-master.yaml
 ```
 
-## Tools
+`username_key_fallbacks` / `secret_key_fallbacks` list alternates. Instance-level targets (e.g. `shared-postgres`) may omit a changelog and become connection shells unless `--changelog-file` is supplied.
 
-| Command | Purpose |
-|---------|---------|
-| `liquibase-shell` | Open an interactive Liquibase shell through a Kubernetes port-forward |
-| `liquibase-update` | Run the legacy one-shot Liquibase update Job |
-| `tsdb-snapshot` | Create and manage TimescaleDB snapshots |
+## How It Works
 
-## Liquibase Shell
+- `liquibase-shell` opens the kubectl port-forward, waits on it (`nc`), pulls credentials from the named Secret, and either drives Liquibase (local CLI or Docker fallback) or exports `LB_DEFAULTS_FILE`, `PG*`/connection env, and `LB_CHANGELOG_PATH`/`LB_CHANGELOG_DIR` for `--shell` mode while keeping the forward alive.
+- SQL templates — `bin/pgbouncer-auth-setup.sql` (PgBouncer auth) and `bin/sql/create-migrate-user.sql` (migration user) — are copy-and-customize, not auto-executed.
 
-```bash
-liquibase-shell                 # prompt for a target
-liquibase-shell start-app       # interactive Liquibase menu
-liquibase-shell start-app -- status
-liquibase-shell start-app -- update-sql
-liquibase-shell start-app --shell
-liquibase-shell shared-postgres --shell
-liquibase-shell shared-postgres -- --changelog-file=/path/to/changelog.yaml status
-```
+## Repo Layout
 
-`--shell` exports `LB_DEFAULTS_FILE`, `PGHOST`, `PGPORT`, `PGDATABASE`,
-`PGUSER`, and `PGPASSWORD` for PostgreSQL targets while keeping the
-port-forward alive. It also exports `LB_CHANGELOG_PATH` and
-`LB_CHANGELOG_DIR`; these are empty for connection-only instance targets.
-
-## SQL Templates
-
-| File | Purpose |
-|------|---------|
-| `bin/pgbouncer-auth-setup.sql` | Configure PgBouncer authentication |
-| `bin/sql/create-migrate-user.sql` | Create migration database user |
-
-Copy these to your project and adjust credentials/database names before use.
+- `bin/` — the tools plus SQL templates
+- `docs/` — PROJ-ARCH/HOWTO/LAYOUT notes
