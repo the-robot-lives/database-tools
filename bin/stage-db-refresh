@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# =============================================================================
+# stage-db-refresh — one-shot re-clone of stage-gnp-timescaledb from prod
+#
+# Implements Phase 7 of docs/stage-bifurcation.md ("Data Refresh Script",
+# left as future work there). stage-gnp-timescaledb's chart already knows how
+# to clone+promote+rename on FIRST boot against a fresh PVC (see
+# helm/stage-gnp-timescaledb/templates/configmap.yaml init-clone.sh /
+# promote.sh) — this script just drives that existing machinery end to end:
+#
+#   1. Bump clone.volumeTag so the StatefulSet's volumeClaimTemplate gets a
+#      new name (the current PVC is immutable on the STS, so a same-name
+#      volumeClaimTemplate would not force a re-clone).
+#   2. Delete the StatefulSet (persistentVolumeClaimRetentionPolicy: Retain
+#      keeps the OLD PVC around, untouched, as a rollback point).
+#   3. helm upgrade with the new volumeTag and keda.enabled=false (scale-to-
+#      zero must stay off during a clone — see values.yaml's own warning).
+#   4. Poll for the .stage-promoted marker (pg_basebackup + promote.sh
+#      completing) via kubectl exec.
+#   5. helm upgrade again with keda.enabled=true to re-enable scale-to-zero.
+#
+# The old PVC is NEVER deleted by this script — it's printed at the end so
+# you can verify the new clone before reclaiming the old volume's storage.
+#
+# Usage:
+#   stage-db-refresh                  # plan + prompt for confirmation
+#   stage-db-refresh --yes            # skip the interactive confirmation
+#   stage-db-refresh --dry-run        # print the plan and exit, no cluster calls
+#   stage-db-refresh --tag v3         # explicit new volumeTag (default: auto-increment)
+#
+# Scope: TimescaleDB only. MySQL stage refresh is a separate, already-manual
+# mysqldump procedure (docs/stage-bifurcation.md Phase 3) — not this script.
+# =============================================================================
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+K8_LIB_DIR="${K8_LIB_DIR:-${HOME}/.local/share/k8-lib}"
+INFRA_ROOT="${INFRA_ROOT:-$(pwd)}"
+
+source "$K8_LIB_DIR/bin/common.sh"
+source "$K8_LIB_DIR/bin/assist.sh"
+_k8_check_assist "$0" "$@"
+
+NAMESPACE="gnp-staging"
+RELEASE="stage-gnp-timescaledb"
+CHART_DIR="${INFRA_ROOT}/helm/stage-gnp-timescaledb"
+STS="stage-gnp-timescaledb"
+POD="stage-gnp-timescaledb-0"
+MARKER="/var/lib/postgresql/data/pgdata/.stage-promoted"
+
+DRY_RUN=false
+ASSUME_YES=false
+NEW_TAG=""
+# Bound how long we'll poll for promotion. Prod data dir was ~74.2Gi on
+# 2026-07-07 (see values.yaml comment); pg_basebackup + catch-up over
+# cluster-internal network is normally well under an hour, but bound
+# generously rather than hang the operator's terminal forever.
+POLL_TIMEOUT_SECONDS="${STAGE_DB_REFRESH_TIMEOUT:-7200}"
+POLL_INTERVAL_SECONDS=20
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=true; shift ;;
+    --yes) ASSUME_YES=true; shift ;;
+    --tag) NEW_TAG="$2"; shift 2 ;;
+    --tag=*) NEW_TAG="${1#--tag=}"; shift ;;
+    -h|--help)
+      sed -n '2,33p' "$0"; exit 0 ;;
+    *) die "Unknown argument: $1" ;;
+  esac
+done
+
+command -v helm >/dev/null || die "helm not found in PATH"
+command -v kubectl >/dev/null || die "kubectl not found in PATH"
+
+# ── Resolve current volume tag from the live StatefulSet ───────────────────
+step "Resolving current clone.volumeTag from the live StatefulSet"
+CURRENT_CLAIM_NAME="$(kubectl -n "$NAMESPACE" get statefulset "$STS" \
+  -o jsonpath='{.spec.volumeClaimTemplates[0].metadata.name}' 2>/dev/null || true)"
+
+if [[ -z "$CURRENT_CLAIM_NAME" ]]; then
+  warn "No existing StatefulSet found — this looks like a first-time clone, not a refresh."
+  CURRENT_TAG=""
+else
+  # Claim name is stage-gnp-timescaledb-data-<tag>
+  CURRENT_TAG="${CURRENT_CLAIM_NAME#stage-gnp-timescaledb-data-}"
+  ok "Current volumeTag: ${CURRENT_TAG} (PVC: ${CURRENT_CLAIM_NAME})"
+fi
+
+if [[ -z "$NEW_TAG" ]]; then
+  if [[ "$CURRENT_TAG" =~ ^v([0-9]+)$ ]]; then
+    NEW_TAG="v$(( BASH_REMATCH[1] + 1 ))"
+  else
+    NEW_TAG="v$(date -u +%Y%m%d%H%M%S)"
+  fi
+fi
+[[ "$NEW_TAG" == "$CURRENT_TAG" ]] && die "New tag ($NEW_TAG) matches current tag — refusing to no-op-clone onto the same PVC."
+
+OLD_PVC="stage-gnp-timescaledb-data-${CURRENT_TAG}"
+NEW_PVC="stage-gnp-timescaledb-data-${NEW_TAG}"
+
+echo ""
+echo "  ─────────────────────────────────────────────────────────"
+echo "  Plan"
+echo "  ─────────────────────────────────────────────────────────"
+echo "  Namespace:      $NAMESPACE"
+echo "  StatefulSet:    $STS  (will be deleted and recreated)"
+echo "  Old PVC:        ${OLD_PVC:-<none>}  (RETAINED — not deleted by this script)"
+echo "  New PVC:        $NEW_PVC  (fresh pg_basebackup from gnp-timescaledb.gnp)"
+echo "  KEDA:            disabled during clone, re-enabled after promotion"
+echo "  Poll timeout:   ${POLL_TIMEOUT_SECONDS}s (override with STAGE_DB_REFRESH_TIMEOUT)"
+echo "  ─────────────────────────────────────────────────────────"
+echo ""
+warn "This takes stage's TimescaleDB (and everything pointed at stage-gnp-pgbouncer) offline for the duration of the clone."
+
+if [[ "$DRY_RUN" == "true" ]]; then
+  info "Dry run — stopping here, no cluster changes made."
+  exit 0
+fi
+
+if [[ "$ASSUME_YES" != "true" ]]; then
+  read -r -p "Type 'yes' to proceed: " CONFIRM
+  [[ "$CONFIRM" == "yes" ]] || die "Aborted."
+fi
+
+# ── Delete the StatefulSet (PVC retained per persistentVolumeClaimRetentionPolicy) ──
+if [[ -n "$CURRENT_TAG" ]]; then
+  step "Deleting StatefulSet $STS (foreground — waits for pod termination)"
+  kubectl -n "$NAMESPACE" delete statefulset "$STS" --cascade=foreground --wait=true
+  ok "StatefulSet deleted; PVC $OLD_PVC retained"
+fi
+
+# ── Recreate with new volumeTag, KEDA off ───────────────────────────────────
+step "helm upgrade — new volumeTag=$NEW_TAG, keda.enabled=false"
+helm upgrade --install "$RELEASE" "$CHART_DIR" \
+  --namespace "$NAMESPACE" --create-namespace \
+  --set "clone.volumeTag=${NEW_TAG}" \
+  --set "keda.enabled=false" \
+  --wait --timeout 120m
+ok "StatefulSet recreated on PVC $NEW_PVC"
+
+# ── Poll for promotion ──────────────────────────────────────────────────────
+step "Waiting for clone + promotion (marker: $MARKER)"
+ELAPSED=0
+while true; do
+  if kubectl -n "$NAMESPACE" exec "$POD" -- test -f "$MARKER" 2>/dev/null; then
+    ok "Promotion marker present — clone complete"
+    break
+  fi
+  if (( ELAPSED >= POLL_TIMEOUT_SECONDS )); then
+    die "Timed out after ${POLL_TIMEOUT_SECONDS}s waiting for promotion. Check: kubectl -n $NAMESPACE logs $POD -c timescaledb"
+  fi
+  info "Still cloning/catching up (${ELAPSED}s elapsed)..."
+  sleep "$POLL_INTERVAL_SECONDS"
+  ELAPSED=$(( ELAPSED + POLL_INTERVAL_SECONDS ))
+done
+
+# ── Re-enable KEDA ───────────────────────────────────────────────────────────
+step "helm upgrade — keda.enabled=true"
+helm upgrade --install "$RELEASE" "$CHART_DIR" \
+  --namespace "$NAMESPACE" --create-namespace \
+  --set "clone.volumeTag=${NEW_TAG}" \
+  --set "keda.enabled=true" \
+  --wait --timeout 5m
+ok "KEDA scale-to-zero re-enabled"
+
+# ── Sync the repo's values.yaml to match the now-running volumeTag ─────────
+# (a working-tree edit only — this script never commits; see
+# feedback_no_auto_commits. Review the diff and commit yourself.)
+step "Updating helm/stage-gnp-timescaledb/values.yaml volumeTag to match cluster"
+sed -i.bak "s/volumeTag: \"${CURRENT_TAG:-__none__}\"/volumeTag: \"${NEW_TAG}\"/" "$CHART_DIR/values.yaml" \
+  && rm -f "$CHART_DIR/values.yaml.bak" \
+  || warn "Could not auto-update values.yaml volumeTag — update it manually to \"${NEW_TAG}\""
+
+echo ""
+echo -e "${GRN}Stage TimescaleDB refreshed${NC}"
+echo -e "  New volumeTag: ${NEW_TAG}"
+echo -e "  Old PVC (retained, not deleted): ${OLD_PVC:-<none>}"
+echo ""
+echo -e "  Verify: kubectl -n $NAMESPACE exec $POD -- psql -U postgres -c '\\l' | grep gnp-stage-db"
+if [[ -n "$CURRENT_TAG" ]]; then
+  echo -e "  Once verified, reclaim old storage manually:"
+  echo -e "    kubectl -n $NAMESPACE delete pvc ${OLD_PVC}"
+fi

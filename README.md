@@ -70,6 +70,7 @@ liquibase_targets:   # or: databases:
 | `liquibase-shell` | Open an interactive Liquibase shell through a Kubernetes port-forward |
 | `liquibase-update` | Run the legacy one-shot Liquibase update Job |
 | `tsdb-snapshot` | Create and manage TimescaleDB snapshots |
+| `stage-db-refresh` | Re-clone stage-gnp-timescaledb from prod (Phase 7 of `docs/stage-bifurcation.md`) |
 
 ## Liquibase Shell
 
