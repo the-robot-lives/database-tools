@@ -1,5 +1,7 @@
 # Project Schema — database-utils
 
+〚📁:0072ade4-09a1-51f3-85e6-6be1256daf24〛 docs/PROJ-SCHEMA.md :: Consumed config structures, env vars, and shipped SQL templates (no own persistence layer).
+
 > **No persistence layer.** This package is a set of CLI database *administration*
 > tools — it defines **no database of its own**: no SQL schema, no migrations, no
 > models, no state files. The artifacts documented below are (1) configuration

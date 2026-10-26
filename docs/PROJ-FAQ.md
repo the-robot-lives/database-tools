@@ -1,5 +1,7 @@
 # PROJ-FAQ — database-utils
 
+〚📁:8a6d7b3a-dd26-52ea-aecc-3397c167d2fd〛 docs/PROJ-FAQ.md :: Why/when/comparison questions with cross-links to HOWTO and ARCH.
+
 Why/when/compared-to-what questions. For *what it is* see [PROJ-ARCH.md](PROJ-ARCH.md); for *how to do it* see [PROJ-HOWTO.md](PROJ-HOWTO.md).
 
 ## Motivation

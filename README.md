@@ -1,5 +1,7 @@
 # database-tools
 
+〚📁:98db377e-6da1-5e7b-9810-231b9707bd3b〛 README.md :: Entry point — what/why, install, config, usage, and how the tools work.
+
 **Repo:** https://github.com/the-robot-lives/database-tools
 
 Liquibase migration shells, database provisioning, and TimescaleDB snapshot helpers for the Noizu Kubernetes fleet.

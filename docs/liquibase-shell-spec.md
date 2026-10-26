@@ -1,5 +1,7 @@
 # liquibase-shell — Specification
 
+〚📁:b1464853-e70e-5feb-b243-0e08f767ae51〛 docs/liquibase-shell-spec.md :: Design/behavior spec — config resolution, safety modes, shell mode, Docker fallback.
+
 ## Overview
 
 Interactive Liquibase shell that establishes `kubectl port-forward` to Kubernetes database services, fetches credentials from K8s secrets, and runs Liquibase commands against the forwarded connection.

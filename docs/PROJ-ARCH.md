@@ -1,5 +1,7 @@
 # Project Architecture
 
+〚📁:a948d762-7f5a-5f49-a4a6-373e27ae838e〛 docs/PROJ-ARCH.md :: Architecture overview — tool map, system diagram, design decisions, dependencies.
+
 ## Overview
 
 **database-utils** is a Bash/SQL utility package for operating K8s-hosted

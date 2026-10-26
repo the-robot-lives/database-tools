@@ -1,5 +1,7 @@
 # PROJ-HOWTO — database-utils
 
+〚📁:6e4a3078-cd2f-5aef-bbc7-b88ed5e51780〛 docs/PROJ-HOWTO.md :: Task-oriented guides — install, migrate, provision, snapshot.
+
 Task-oriented guides for the things you'll actually do with this toolkit. For
 *what it is* see [PROJ-ARCH.md](PROJ-ARCH.md); for *where things live* see
 [PROJ-LAYOUT.md](PROJ-LAYOUT.md).
