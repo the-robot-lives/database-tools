@@ -26,15 +26,18 @@ Used by `liquibase-shell`, `liquibase-update`, `provision-db`. Map of target-nam
 |-------|----------|---------|-------------|
 | `namespace` | yes | — | k8s namespace of the DB service |
 | `service` | yes | — | k8s service to port-forward (e.g. `svc/shared-postgres`) |
-| `remote_port` | no | `5432` | DB port on the service |
-| `local_port` | no | `55432`/`54320` | Local port-forward endpoint |
+| `remote_port` | yes | — | DB port on the service (required — no default) |
+| `local_port` | yes | — | Local port-forward endpoint (required — no default) |
 | `db_type` | yes | — | `postgresql` / `mysql` |
-| `db_name` | yes | — | Database name |
+| `db_name` *or* `db_name_key` (+`db_name_key_fallbacks`) | one of | — | Database name, or the Secret key holding it (fallback list tried in order) |
+| `db_name_secret_name` / `db_name_secret_namespace` | no | `secret_name` / `secret_namespace` | Separate Secret holding the database name |
 | `schema` | no | `public` | Default schema |
 | `secret_name` | yes | — | k8s Secret holding DB credentials |
-| `username_key` (+`username_key_fallbacks`) | yes | — | Secret key for username (fallback list tried in order) |
+| `secret_namespace` | no | target `namespace` | Namespace of the credential Secret |
+| `username` *or* `username_key` (+`username_key_fallbacks`) | one of | — | Literal username, or the Secret key holding it (fallback list tried in order) |
+| `username_secret_name` / `username_secret_namespace` | no | `secret_name` / `secret_namespace` | Separate Secret holding the username |
 | `secret_key` (+`secret_key_fallbacks`) | yes | — | Secret key for password |
-| `safety` | no | — | e.g. `destructive` (extra confirm gates) |
+| `safety` | no | `normal` | `readonly` (whitelist-only: `status diff validate history update-sql rollback-count-sql changelog-sync-sql`); `destructive` (confirms `update`/rollback/`drop-all`/`clear-checksums` unless `--yes`/`LIQUIBASE_ASSUME_YES`) |
 | `changelog_dir` / `changelog_file` | no | — | Liquibase changelog path; omit ⇒ connection-only shell |
 | `role_user_dc` / `role_password_dc` | `--db` only | — | `dc` addresses for provision-db role creds |
 | `redis_*` fields (`redis_password_dc`, `redis_service`, `redis_user`, `redis_namespace`, `redis_port`, `redis_local_port`, `redis_acl_rules`, `redis_admin_secret`, `redis_admin_password_key`, `redis_admin_namespace`) | no | `svc/app-valkey`, `+@all`, `app-valkey-secrets`, … | Optional Valkey ACL provisioning (provision-db) |
@@ -58,9 +61,13 @@ Used by `tsdb-snapshot` (`--config <name>` selects a target, not a file). Map of
 |-----|----------|---------|
 | `LIQUIBASE_CONFIG` | liquibase-shell | Override config file search |
 | `LIQUIBASE_ASSUME_YES` | liquibase-shell | Skip destructive confirms (agent/CI) |
+| `LIQUIBASE_DOCKER_IMAGE` | liquibase-shell | Docker fallback image (default `liquibase/liquibase:4.29`) |
+| `LIQUIBASE_TAG` | liquibase-update | In-cluster Job image tag (default `v1.0.1`) |
 | `K8_LIB_DIR` | all | Override `~/.local/share/k8-lib` helper location |
 | `INFRA_ROOT` | tsdb-snapshot | Config-search root (default cwd) |
 | `K8_TSDB_PSQL_WAIT_SECS` | tsdb-snapshot | pg_backup_start wait budget (default 900s) |
+| `K8_TSDB_SNAPSHOT_TIMEOUT` | tsdb-snapshot | Bound the EBS snapshot-completion wait in seconds (default `0` = wait unbounded) |
+| `AWS_DEFAULT_REGION` / `K8_AWS_REGION` | tsdb-snapshot | Snapshot region (default `us-east-1`) |
 | `KUBECONFIG` | all | liquibase-shell defaults to `~/.kube/noizu/config` if unset |
 
 `liquibase-shell --shell` **exports** to the child shell: `LB_DEFAULTS_FILE`,

@@ -5,6 +5,7 @@
 
 ## 2026-10-26
 - docs: correct stale "main is CI/CD-only" deploy note — merging into main triggers CI/CD (user-verified 2026-10-26)
+- docs: doc-sweep — PROJ-SCHEMA corrections verified against source (`remote_port`/`local_port` required, `db_name`/`username` key-alternates, `safety: normal` default, `K8_TSDB_SNAPSHOT_TIMEOUT`/`LIQUIBASE_TAG`/`LIQUIBASE_DOCKER_IMAGE`/AWS-region env vars), new THREAT-MODEL (+ `.summary.md`); doc-pointer seed (`.meta/pointers.yaml`, 7 anchors) landed via #5
 
 ## [m4-provision-db] — 2026-07-08 — tag: `utilities-database-database-utils/m4-provision-db`
 New `provision-db` tool: creates the Postgres database + login role for an app on an already-running cluster instance, since a live instance only runs `initdb.d/` scripts on first init of an empty data dir — apps added later never get provisioned automatically. Reuses `liquibase_targets.<target>` from `.infra-config.yaml` for connection details; splits credential sourcing so role creds come from `dc` (source of truth, mirrors Infisical-synced secrets) while superuser creds come from the live K8s admin secret (auto-generated, not pinned in `dc`).

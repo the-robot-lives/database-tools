@@ -8,7 +8,7 @@ Full detail: [PROJ-SCHEMA.md](PROJ-SCHEMA.md).
 - `liquibase_targets` / `databases` — k8s service + secret-key mapping per target;
   optional changelog, `role_*_dc`, `redis_*` fields. Consumers: liquibase-shell, liquibase-update, provision-db.
 - `tsdb_snapshot_targets` — namespace/pod_label/snapshot name/`crash_only` per target. Consumer: tsdb-snapshot.
-- Env: `LIQUIBASE_CONFIG`, `LIQUIBASE_ASSUME_YES`, `K8_LIB_DIR`, `INFRA_ROOT`, `K8_TSDB_PSQL_WAIT_SECS`, `KUBECONFIG`.
+- Env: `LIQUIBASE_CONFIG`, `LIQUIBASE_ASSUME_YES`, `LIQUIBASE_DOCKER_IMAGE`, `LIQUIBASE_TAG`, `K8_LIB_DIR`, `INFRA_ROOT`, `K8_TSDB_PSQL_WAIT_SECS`, `K8_TSDB_SNAPSHOT_TIMEOUT`, `AWS_DEFAULT_REGION`/`K8_AWS_REGION`, `KUBECONFIG`.
 - `--shell` exports: `LB_DEFAULTS_FILE`, `PGHOST/PORT/DATABASE/USER/PASSWORD`, `LB_CHANGELOG_PATH/DIR`.
 - State files: **none**.
 
