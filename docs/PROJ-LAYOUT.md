@@ -1,5 +1,7 @@
 # Project Layout — database-utils
 
+〚📁:a368b2f4-a76d-5380-a248-2357ce40576a〛 docs/PROJ-LAYOUT.md :: Annotated directory tree, install mapping, config notes, setup table.
+
 Terminal utility package: Liquibase migration, on-demand DB/role provisioning,
 TimescaleDB EBS snapshot, and SQL admin templates for K8s-hosted databases.
 Installs to `~/.local/bin` via `make install` (or monorepo `make install-utilities`).
