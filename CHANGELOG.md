@@ -1,5 +1,8 @@
 # Changelog — utilities/database/database-utils
 
+## 2026-10-28
+- docs: add AGENT-README.md (agent orientation)
+
 ## [Unreleased]
 - PROJ-ARCH.md / PROJ-LAYOUT.md (+ `.summary.md` companions) expanded with fuller architecture and directory-layout documentation.
 
