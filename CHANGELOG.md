@@ -1,5 +1,8 @@
 # Changelog — utilities/database/database-utils
 
+## 2026-11-24
+- fix(liquibase-shell): ledger-form guard (warn on non-`changelog` changelog dir; `LIQUIBASE_SHELL_STRICT_LEDGER_FORM=1` exits 1) + hermetic fetch-failure regression tests wired into `make test` (THERO2-027)
+
 ## 2026-10-28
 - docs: add AGENT-README.md (agent orientation)
 

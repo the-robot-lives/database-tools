@@ -284,6 +284,38 @@ else
   CHANGELOG_SEARCH_PATH=""
 fi
 
+# --- Ledger-form guard ---
+# The standard layout is a changelog directory literally named `changelog`
+# (e.g. <app>/priv/repo/changelog or db/changelog-master.yaml under `changelog/`).
+# Historical databasechangelog rows record FILENAME in whatever form was in use
+# when the changeset ran. If the target's changelog lives in a directory with a
+# different name (db/changelog, changelogs, ...), a path change or a mixed-form
+# history can make Liquibase see old changesets as new (silently re-run) or
+# never match them (stay pending forever). Warn loudly; LIQUIBASE_SHELL_STRICT_LEDGER_FORM=1
+# escalates to exit 1. Known non-standard targets today: meetme (db/changelog),
+# watching (changelog/master.xml), media_tool (changelogs/changelog.yaml).
+if [[ "$HAS_CHANGELOG" == true && -n "$CHANGELOG_PATH" ]]; then
+  LEDGER_DIR_FORM="$(dirname "$CHANGELOG_PATH")"
+  LEDGER_DIR_FORM="$(basename "${LEDGER_DIR_FORM:-/}")"
+  if [[ "$LEDGER_DIR_FORM" != "changelog" ]]; then
+    cat <<WARN
+
+WARNING [ledger-form]: target '$TARGET' uses a non-standard changelog directory form.
+  Resolved changelog path: $CHANGELOG_PATH
+  Directory form:          $LEDGER_DIR_FORM (standard is 'changelog')
+  Hazard: historical databasechangelog rows may record a different filename
+  form for this ledger; after a path change, changesets can silently re-run
+  or remain stuck as pending. Verify against the live databasechangelog table
+  before running update against this target.
+
+WARN
+    if [[ "${LIQUIBASE_SHELL_STRICT_LEDGER_FORM:-0}" == "1" ]]; then
+      echo "ERROR [ledger-form]: LIQUIBASE_SHELL_STRICT_LEDGER_FORM=1 — refusing to continue."
+      exit 1
+    fi
+  fi
+fi
+
 SECRET_KEYS=("$SECRET_KEY")
 while IFS= read -r key; do
   [[ -n "$key" ]] && SECRET_KEYS+=("$key")

@@ -6,7 +6,7 @@ compile:
 	@true
 
 test:
-	@true
+	@bash test/liquibase-shell-test.bash
 
 install:
 	@mkdir -p $(INSTALL_DIR)
